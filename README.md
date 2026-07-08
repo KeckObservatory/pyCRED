@@ -15,7 +15,7 @@ Depending on the chiller used, follow instructions either from the OCAM2k short 
 3. Connect to gpupc:3 on VNC viewer on your laptop
 4. Right click on the desktop and open a terminal
 5. Run `cd/opt/EDTpdv`
-6. Once you’re in the EDT directory, run the configuration file to set the frame grabber to capture images `./initcam -f ~/CRED-One/cred_default.cfg`
+6. Once you’re in the EDT directory, run the configuration file to set the frame grabber to capture images ` ./initcam -f ~/../../usr/local/aodev/CRED-One/cred_default.cfg `
 7. Run `./serial_cmd ‘temperature'` to get the current temperature
 8. If this returns a garbage output, swap the cameralink cables on the gpu side.
 9. Then run `./serial_cmd ‘temperature’` again to verify

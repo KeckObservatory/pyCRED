@@ -1,0 +1,17 @@
+gui:
+  window_title: "C-RED ONE Monitor"
+  window_geometry: [100, 100, 1200, 800]
+  top_splitter_sizes: [350, 850]
+  main_splitter_sizes: [650, 150]
+
+monitor:
+  refresh_interval_ms: 2000
+  max_history_points: 600
+
+logging:
+  max_lines: 300
+  font_size: 8
+
+styling:
+  use_keck_theme: true
+  font_size: 9

@@ -7,6 +7,14 @@ gui:
 cam:
   edt_dir: "/opt/EDTpdv"
   tmp_frame_path: "/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw"
+  # Ring-buffer count for `take -N <n>`. 200 matches cred_test_prelim.py
+  # AND CREDOne_Disp.py's live display (the known-working reference),
+  # both hardcoded to 200 unconditionally -- so this is NOT confirmed to
+  # be mode-dependent. Left configurable in case testing proves otherwise.
+  take_nbuffers: 200
+  # Path used by the "Re-init Frame Grabber" button, matching the
+  # `initcam` command from the pyCRED README's camera startup steps.
+  cred_cfg_path: "~/../../usr/local/aodev/CRED-One/cred_default.cfg"
 
 fps:
   range: [1, 3500]

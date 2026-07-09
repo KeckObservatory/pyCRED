@@ -37,7 +37,7 @@ class CredOneController:
     FRAME_SHAPE = (256, 320)
 
     def __init__(self, edt_dir="/opt/EDTpdv",
-                 tmp_frame_path="/home/aodev/CRED-One/Data/tmp/CRED_frame.raw",
+                 tmp_frame_path="/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw",
                  logger=None):
         self.edt_dir = edt_dir
         self.tmp_frame_path = tmp_frame_path

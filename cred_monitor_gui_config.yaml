@@ -4,6 +4,10 @@ gui:
   top_splitter_sizes: [350, 850]
   main_splitter_sizes: [650, 150]
 
+cam:
+  edt_dir: "/opt/EDTpdv"
+  tmp_frame_path: "/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw"
+
 monitor:
   refresh_interval_ms: 2000
   max_history_points: 600

@@ -572,7 +572,12 @@ if __name__ == "__main__":
     app.setApplicationDisplayName("C-RED ONE Control GUI")
 
     config = load_config()
-    config["cam"] = CredOneController()
+    cam_cfg = config.get("cam", {})
+    config["cam"] = CredOneController(
+        edt_dir=cam_cfg.get("edt_dir", "/opt/EDTpdv"),
+        tmp_frame_path=cam_cfg.get("tmp_frame_path",
+                                    "/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw"),
+    )
 
     window = CredControlMainWindow(config)
     window.show()

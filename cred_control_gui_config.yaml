@@ -15,6 +15,13 @@ cam:
   # Path used by the "Re-init Frame Grabber" button, matching the
   # `initcam` command from the pyCRED README's camera startup steps.
   cred_cfg_path: "~/../../usr/local/aodev/CRED-One/cred_default.cfg"
+  # Seconds to wait after any set fps/gain/mode/ndr/rawimages call (or a
+  # frame grabber re-init) before allowing a capture. Confirmed necessary
+  # on hardware -- captures fail with a pdv_multibuf ring-buffer error if
+  # attempted too soon after a settings change. 70s matches the more
+  # conservative wait in cred_test_prelim.py's dark_bursts(); tune down
+  # if testing shows a shorter wait is sufficient.
+  settle_seconds: 70
 
 fps:
   range: [1, 3500]

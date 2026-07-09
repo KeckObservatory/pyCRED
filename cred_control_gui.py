@@ -77,6 +77,19 @@ class CredControlWidget(QWidget):
 
         self.cred_cfg_path = config.get("cred_cfg_path",
                                          "~/../../usr/local/aodev/CRED-One/cred_default.cfg")
+        # Confirmed on hardware: capturing too soon after a mode/fps/gain/
+        # ndr/rawimages change fails (pdv_multibuf "Invalid argument").
+        # cred_test_prelim.py's own dark_bursts()/dark_bursts_gain() wait
+        # 30-70s after such changes before capturing -- default to the
+        # more conservative 70s since mode changes are the trigger here.
+        # NOTE: read from a dedicated top-level config key, not
+        # config["cam"] -- that key gets overwritten with the live
+        # CredOneController instance in __main__ before this runs.
+        self.settle_seconds = config.get("settle_seconds", 70)
+        self.settle_remaining = 0
+        self.settle_timer = QTimer()
+        self.settle_timer.timeout.connect(self._settle_tick)
+        self.live_view_paused_by_settle = False
 
         self.operation_in_progress = False
         self.current_image_array = None
@@ -189,6 +202,7 @@ class CredControlWidget(QWidget):
         single_btn = QPushButton("Take Single Image")
         single_btn.clicked.connect(self.take_single_image)
         image_layout.addWidget(single_btn)
+        self.single_btn = single_btn
 
         burst_layout = QHBoxLayout()
         self.burst_nframes_input = QSpinBox()
@@ -200,10 +214,21 @@ class CredControlWidget(QWidget):
         burst_layout.addWidget(self.burst_nframes_input)
         burst_layout.addWidget(burst_btn)
         image_layout.addLayout(burst_layout)
+        self.burst_btn = burst_btn
 
         self.live_view_checkbox = QCheckBox("Live View")
         self.live_view_checkbox.stateChanged.connect(self.toggle_live_view)
         image_layout.addWidget(self.live_view_checkbox)
+
+        # Camera-settle status. cred_test_prelim.py's dark_bursts() /
+        # dark_bursts_gain() both insert a 30-70s wait after changing
+        # mode/fps/gain/ndr/rawimages before capturing -- confirmed
+        # necessary on hardware (capture fails if you don't wait). This
+        # label + the settle countdown below enforce the same wait here
+        # instead of relying on remembering to pause manually.
+        self.settle_status_label = QLabel("Ready")
+        self.settle_status_label.setStyleSheet("font-weight: bold;")
+        image_layout.addWidget(self.settle_status_label)
 
         save_btn = QPushButton("Save Current Image")
         save_btn.setStyleSheet("""
@@ -275,6 +300,7 @@ class CredControlWidget(QWidget):
         try:
             raw = self.cam.set_fps(self.fps_input.value())
             self.log.info(f"Set FPS to {self.fps_input.value()}: {raw}")
+            self.start_settle("set fps")
         except CredOneError as e:
             self.log.error(f"Failed to set FPS: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set FPS:\n{e}")
@@ -293,6 +319,7 @@ class CredControlWidget(QWidget):
         try:
             raw = self.cam.set_gain(self.gain_input.value())
             self.log.info(f"Set gain to {self.gain_input.value()}: {raw}")
+            self.start_settle("set gain")
         except CredOneError as e:
             self.log.error(f"Failed to set gain: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set gain:\n{e}")
@@ -302,6 +329,7 @@ class CredControlWidget(QWidget):
         try:
             raw = self.cam.set_readout_mode(mode)
             self.log.info(f"Set readout mode to {mode}: {raw}")
+            self.start_settle("mode change")
         except CredOneError as e:
             self.log.error(f"Failed to set readout mode: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set readout mode:\n{e}")
@@ -321,6 +349,7 @@ class CredControlWidget(QWidget):
         try:
             raw = self.cam.reinit_framegrabber(self.cred_cfg_path)
             self.log.info(f"Frame grabber re-initialized: {raw}")
+            self.start_settle("frame grabber re-init")
         except CredOneError as e:
             self.log.error(f"Failed to re-init frame grabber: {e}")
             QMessageBox.critical(self, "Error", f"Failed to re-init frame grabber:\n{e}")
@@ -329,6 +358,7 @@ class CredControlWidget(QWidget):
         try:
             raw = self.cam.set_ndr(self.ndr_input.value())
             self.log.info(f"Set NDR to {self.ndr_input.value()}: {raw}")
+            self.start_settle("set ndr")
         except CredOneError as e:
             self.log.error(f"Failed to set NDR: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set NDR:\n{e}")
@@ -338,9 +368,53 @@ class CredControlWidget(QWidget):
         try:
             raw = self.cam.set_rawimages(on)
             self.log.info(f"Set raw images {'On' if on else 'Off'}: {raw}")
+            self.start_settle("set rawimages")
         except CredOneError as e:
             self.log.error(f"Failed to set raw images: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set raw images:\n{e}")
+
+    # ------------------------------------------------------------------
+    # Camera-settle period. cred_test_prelim.py's dark_bursts() /
+    # dark_bursts_gain() both wait 30-70s after changing mode/fps/gain/
+    # ndr/rawimages before capturing -- confirmed necessary on hardware
+    # (captures otherwise fail with a pdv_multibuf ring-buffer error).
+    # This enforces the same wait here, with visible feedback, instead of
+    # relying on remembering to pause manually between settings and
+    # capture.
+    # ------------------------------------------------------------------
+    def start_settle(self, reason):
+        self.settle_remaining = self.settle_seconds
+        self._update_settle_label()
+        self.single_btn.setEnabled(False)
+        self.burst_btn.setEnabled(False)
+        if self.live_view_enabled:
+            self.live_view_paused_by_settle = True
+            self.live_view_timer.stop()
+            self.log.info("Live view paused during camera settle period")
+        self.log.info(f"Camera settling for {self.settle_seconds}s after {reason} "
+                       f"(see dark_bursts()/dark_bursts_gain() in cred_test_prelim.py)")
+        self.settle_timer.start(1000)
+
+    def _settle_tick(self):
+        self.settle_remaining -= 1
+        self._update_settle_label()
+        if self.settle_remaining <= 0:
+            self.settle_timer.stop()
+            self.single_btn.setEnabled(True)
+            self.burst_btn.setEnabled(True)
+            self.settle_status_label.setText("Ready")
+            if self.live_view_paused_by_settle:
+                self.live_view_paused_by_settle = False
+                self.live_view_timer.start(self.live_view_interval)
+                self.log.info("Resuming live view after settle period")
+
+    def _update_settle_label(self):
+        if self.settle_remaining > 0:
+            self.settle_status_label.setText(f"Settling: {self.settle_remaining}s remaining")
+            self.settle_status_label.setStyleSheet("font-weight: bold; color: #e67e22;")
+        else:
+            self.settle_status_label.setText("Ready")
+            self.settle_status_label.setStyleSheet("font-weight: bold; color: #2ecc71;")
 
     # ------------------------------------------------------------------
     # Imaging actions
@@ -355,6 +429,11 @@ class CredControlWidget(QWidget):
         if self.operation_in_progress:
             QMessageBox.warning(self, "Operation in Progress", "Another operation is already running.")
             return
+        if self.settle_remaining > 0:
+            QMessageBox.warning(self, "Camera Settling",
+                                 f"Camera is still settling after a recent settings change "
+                                 f"({self.settle_remaining}s remaining). Please wait.")
+            return
         try:
             frame, time_str = self.cam.get_image()
             self.display_image(frame, title=f"Single frame ({time_str})")
@@ -366,6 +445,11 @@ class CredControlWidget(QWidget):
     def take_burst(self):
         if self.operation_in_progress:
             QMessageBox.warning(self, "Operation in Progress", "Another operation is already running.")
+            return
+        if self.settle_remaining > 0:
+            QMessageBox.warning(self, "Camera Settling",
+                                 f"Camera is still settling after a recent settings change "
+                                 f"({self.settle_remaining}s remaining). Please wait.")
             return
 
         nframes = self.burst_nframes_input.value()
@@ -452,14 +536,20 @@ class CredControlWidget(QWidget):
     def toggle_live_view(self, state):
         self.live_view_enabled = state == 2  # Qt.Checked
         if self.live_view_enabled:
-            self.live_view_timer.start(self.live_view_interval)
-            self.log.info("Live view started")
+            if self.settle_remaining > 0:
+                self.live_view_paused_by_settle = True
+                self.log.info(f"Live view enabled but camera is settling "
+                               f"({self.settle_remaining}s remaining) -- will start once ready")
+            else:
+                self.live_view_timer.start(self.live_view_interval)
+                self.log.info("Live view started")
         else:
             self.live_view_timer.stop()
+            self.live_view_paused_by_settle = False
             self.log.info("Live view stopped")
 
     def live_view_tick(self):
-        if self.operation_in_progress:
+        if self.operation_in_progress or self.settle_remaining > 0:
             return
         try:
             frame, time_str = self.cam.get_image()
@@ -610,6 +700,7 @@ if __name__ == "__main__":
     cam_cfg = config.get("cam", {})
     config["cred_cfg_path"] = cam_cfg.get("cred_cfg_path",
                                            "~/../../usr/local/aodev/CRED-One/cred_default.cfg")
+    config["settle_seconds"] = cam_cfg.get("settle_seconds", 70)
     config["cam"] = CredOneController(
         edt_dir=cam_cfg.get("edt_dir", "/opt/EDTpdv"),
         tmp_frame_path=cam_cfg.get("tmp_frame_path",

@@ -166,26 +166,43 @@ class CredMonitorWidget(QWidget):
         refresh_layout.addWidget(manual_refresh_btn, 2, 0, 1, 2)
         control_layout.addWidget(refresh_box)
 
+        # Optional history-plot display. Off by default -- most of the
+        # time the live readouts above are all that's needed; this is for
+        # visually watching a cooldown/warmup progress over time.
+        display_box = QGroupBox("Display")
+        display_box_layout = QVBoxLayout(display_box)
+        self.show_plots_checkbox = QCheckBox("Show History Plots")
+        self.show_plots_checkbox.setChecked(False)
+        self.show_plots_checkbox.stateChanged.connect(self.toggle_show_plots)
+        display_box_layout.addWidget(self.show_plots_checkbox)
+        control_layout.addWidget(display_box)
+
         control_layout.addStretch()
 
         # ---------------- Right panel: temperature-history plot ----------
+        # Dark-themed to match the rest of the GUI; hidden by default
+        # (toggled via the "Show History Plots" checkbox above) since not
+        # everyone needs the visual trend, just the live numbers.
+        PLOT_BG = "#1e1e1e"
+        PLOT_FG = "white"
+
         self.display_widget = QWidget()
         self.display_widget.setMinimumWidth(600)
         self.display_widget.setMinimumHeight(500)
+        self.display_widget.setVisible(False)
         display_layout = QVBoxLayout(self.display_widget)
 
         # Two stacked subplots sharing the time axis: temperature on top,
         # pressure below. Both update on every poll for a near-continuous
         # readout -- handy for watching a cooldown/warmup in progress.
-        self.figure = Figure(figsize=(6, 6), dpi=100)
+        # Only cryopt (pulse tube) and cryod (diode) are plotted here,
+        # even if other sensors show up in the readout table above.
+        self.figure = Figure(figsize=(6, 6), dpi=100, facecolor=PLOT_BG)
         self.canvas = FigureCanvas(self.figure)
         self.axes_temp = self.figure.add_subplot(211)
         self.axes_pressure = self.figure.add_subplot(212, sharex=self.axes_temp)
-        self.axes_temp.set_ylabel("Temperature (K)")
-        self.axes_temp.set_title("Temperature History")
-        self.axes_pressure.set_xlabel("Time")
-        self.axes_pressure.set_ylabel("Pressure")
-        self.axes_pressure.set_title("Pressure History")
+        self._style_dark_axes(self.axes_temp, "Temperature (K)", "Temperature History")
+        self._style_dark_axes(self.axes_pressure, "Pressure", "Pressure History", xlabel="Time")
         self.figure.tight_layout()
         display_layout.addWidget(self.canvas)
 
@@ -211,6 +228,27 @@ class CredMonitorWidget(QWidget):
         main_splitter.setCollapsible(1, True)
         main_splitter.setSizes(self.config.get("gui", {}).get("main_splitter_sizes", [650, 150]))
 
+    def _style_dark_axes(self, ax, ylabel, title, xlabel=None):
+        """Apply consistent dark styling to a plot axes. Must be re-applied
+        after every ax.clear() call since clear() resets styling too."""
+        ax.set_facecolor("#1e1e1e")
+        ax.set_ylabel(ylabel, color="white")
+        ax.set_title(title, color="white")
+        if xlabel:
+            ax.set_xlabel(xlabel, color="white")
+        ax.tick_params(colors="white", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#666666")
+        ax.grid(True, color="#444444", linewidth=0.5, alpha=0.6)
+
+    def toggle_show_plots(self, state):
+        show = state == 2  # Qt.Checked
+        self.display_widget.setVisible(show)
+        if show:
+            # Panel was just revealed -- draw immediately rather than
+            # waiting for the next poll, so it's not blank/stale.
+            self._redraw_history_plots()
+
     # ------------------------------------------------------------------
     # Polling
     # ------------------------------------------------------------------
@@ -227,7 +265,8 @@ class CredMonitorWidget(QWidget):
             self.refresh_temperature(now)
             self.refresh_pressure(now)
             self.refresh_camera_status()
-            self._redraw_history_plots()
+            if self.display_widget.isVisible():
+                self._redraw_history_plots()
         finally:
             self._polling = False
 
@@ -284,25 +323,36 @@ class CredMonitorWidget(QWidget):
             self.temp_grid.addWidget(value_label, row, 1)
             self.temp_value_labels[name] = value_label
 
+    # Only these two sensors get plotted (even if the readout table above
+    # shows others) -- matched by substring since exact key formatting
+    # from get_temperature()'s parser hasn't been confirmed on hardware.
+    # Fixed colors chosen for visibility against the dark background.
+    TEMP_PLOT_SENSORS = {"cryopt": "#00d4ff", "cryod": "#ff6ec7"}
+
     def _redraw_history_plots(self):
         times = list(self.time_history)
 
         self.axes_temp.clear()
-        self.axes_temp.set_ylabel("Temperature (K)")
-        self.axes_temp.set_title("Temperature History")
+        self._style_dark_axes(self.axes_temp, "Temperature (K)", "Temperature History")
+        plotted_any = False
         for name, values in self.temp_history.items():
+            match = next((key for key in self.TEMP_PLOT_SENSORS if key in name.lower()), None)
+            if match is None:
+                continue
             values = list(values)
             n = min(len(times), len(values))
             if n == 0:
                 continue
-            self.axes_temp.plot(times[-n:], values[-n:], marker="o", markersize=2, label=name)
-        if self.temp_history:
-            self.axes_temp.legend(loc="upper right", fontsize=8)
+            self.axes_temp.plot(times[-n:], values[-n:], marker="o", markersize=2,
+                                 label=name, color=self.TEMP_PLOT_SENSORS[match])
+            plotted_any = True
+        if plotted_any:
+            legend = self.axes_temp.legend(loc="upper right", fontsize=8, facecolor="#1e1e1e")
+            for text in legend.get_texts():
+                text.set_color("white")
 
         self.axes_pressure.clear()
-        self.axes_pressure.set_xlabel("Time")
-        self.axes_pressure.set_ylabel("Pressure")
-        self.axes_pressure.set_title("Pressure History")
+        self._style_dark_axes(self.axes_pressure, "Pressure", "Pressure History", xlabel="Time")
         pressure_values = list(self.pressure_history)
         n = min(len(times), len(pressure_values))
         if n > 0:
@@ -311,7 +361,7 @@ class CredMonitorWidget(QWidget):
             plot_times = [t for t, v in zip(times[-n:], pressure_values[-n:]) if v is not None]
             plot_values = [v for v in pressure_values[-n:] if v is not None]
             if plot_values:
-                self.axes_pressure.plot(plot_times, plot_values, marker="o", markersize=2, color="tab:orange")
+                self.axes_pressure.plot(plot_times, plot_values, marker="o", markersize=2, color="#f1c40f")
 
         self.figure.autofmt_xdate()
         self.canvas.draw()

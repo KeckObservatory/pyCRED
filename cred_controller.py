@@ -188,6 +188,10 @@ class CredOneController:
         GUI dropdown.
         """
         return self._serial(f"set mode {mode}")
+    
+    def get_readout_mode(self):
+        """Return the current readout mode string, e.g. 'globalresetbursts'."""
+        return self._serial("mode")
 
     def set_rawimages(self, on=True):
         return self._serial(f"set rawimages {'on' if on else 'off'}")
@@ -195,6 +199,11 @@ class CredOneController:
     def set_ndr(self, ndr):
         """Set number of non-destructive reads before reset (nbreadworeset)."""
         return self._serial(f"set nbreadworeset {ndr}")
+    
+    def get_ndr(self):
+        """Get number of non-destructive reads before reset (nbreadworeset)."""
+        raw = self._serial("nbreadworeset")
+        return self._first_float(raw), raw
 
     # ------------------------------------------------------------------
     # image acquisition (mirrors cred_test_prelim.get_image /

@@ -9,8 +9,8 @@ cam:
   tmp_frame_path: "/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw"
 
 fps:
-  range: [1, 600]
-  default: 60
+  range: [1, 3500]
+  default: 3500
 
 gain:
   range: [0, 1000]

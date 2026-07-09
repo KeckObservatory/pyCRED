@@ -20,6 +20,7 @@ cred_test_prelim.py.
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from glob import glob
 
@@ -169,7 +170,7 @@ class CredOneController:
     # image acquisition (mirrors cred_test_prelim.get_image /
     # get_image_multiframe exactly, wrapped as methods)
     # ------------------------------------------------------------------
-    def get_image(self):
+    def get_image(self, file_wait_timeout=2.0, file_wait_poll=0.05):
         """Grab a single frame via `./take -N 200 -f <tmp_frame_path>`.
         Returns (frame_array, timestamp_str).
 
@@ -178,6 +179,14 @@ class CredOneController:
         file afterward. We do the same, and only raise CredOneError if the
         file that comes back doesn't actually contain a full frame, since
         that's the one failure mode we can detect for certain.
+
+        `take` returning before the frame file is actually written (or not
+        writing one at all, e.g. because the current readout mode needs
+        different acquisition parameters than the ones used here) both
+        show up as the file being briefly/permanently missing. We poll for
+        up to `file_wait_timeout` seconds before giving up, and always
+        raise CredOneError (not a raw FileNotFoundError) so callers only
+        need to catch one exception type.
         """
         os.makedirs(os.path.dirname(self.tmp_frame_path), exist_ok=True)
         cmd = f"./take -N 200 -f '{self.tmp_frame_path}'"
@@ -190,7 +199,21 @@ class CredOneController:
                 print(f"WARNING: {msg}")
 
         time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        im = np.fromfile(self.tmp_frame_path, dtype=np.uint16)
+
+        deadline = time.time() + file_wait_timeout
+        while not os.path.exists(self.tmp_frame_path) and time.time() < deadline:
+            time.sleep(file_wait_poll)
+
+        try:
+            im = np.fromfile(self.tmp_frame_path, dtype=np.uint16)
+        except OSError as e:
+            raise CredOneError(
+                f"Could not read frame file {self.tmp_frame_path} after 'take' "
+                f"(take stdout={stdout!r} stderr={stderr!r}). This can happen if "
+                f"the current readout mode needs different 'take' parameters "
+                f"than -N 200 -- check take's raw output above. Original error: {e}"
+            ) from e
+
         expected = self.FRAME_SHAPE[0] * self.FRAME_SHAPE[1]
         if im.size != expected:
             raise CredOneError(

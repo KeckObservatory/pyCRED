@@ -39,9 +39,21 @@ class CredOneController:
 
     def __init__(self, edt_dir="/opt/EDTpdv",
                  tmp_frame_path="/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw",
+                 take_nbuffers=200,
                  logger=None):
         self.edt_dir = edt_dir
         self.tmp_frame_path = tmp_frame_path
+        # Ring-buffer count passed to `take -N <n>`. 200 matches
+        # cred_test_prelim.py's hardcoded value -- and CREDOne_Disp.py's
+        # live display (the known-working reference) uses that same
+        # hardcoded 200 unconditionally, so buffer count is NOT known to
+        # be mode-dependent. A "pdv_multibuf ... Invalid argument" error
+        # after switching readout mode more likely means the frame
+        # grabber board itself needs re-initializing for the new mode's
+        # frame geometry (see reinit_framegrabber() / the README's
+        # `initcam` step) rather than needing a different -N value here.
+        # Left configurable in case testing on hardware proves otherwise.
+        self.take_nbuffers = take_nbuffers
         self.log = logger
 
     # ------------------------------------------------------------------
@@ -130,6 +142,24 @@ class CredOneController:
     def set_cooling(self, on=True):
         return self._serial(f"set cooling {'on' if on else 'off'}")
 
+    def reinit_framegrabber(self, cfg_path="~/../../usr/local/aodev/CRED-One/cred_default.cfg"):
+        """
+        Re-run the EDT frame grabber init step documented in the pyCRED
+        README's camera startup sequence:
+            cd /opt/EDTpdv; ./initcam -f <cfg_path>
+        This reconfigures the frame grabber board's ROI/tap/buffer setup
+        from the .cfg file. Worth trying if 'take' starts failing with a
+        pdv_multibuf/ring-buffer error after changing the camera's
+        readout mode -- the board's config may be stale relative to the
+        camera's current mode. This is a more invasive operation than the
+        other calls here (equivalent to restarting frame acquisition), so
+        the GUI confirms with the user before calling it.
+        """
+        stdout, stderr, rc = self._run(f"./initcam -f {cfg_path}", timeout=60)
+        if rc != 0:
+            raise CredOneError(f"initcam failed (rc={rc}): {stderr or stdout}")
+        return stdout
+
     # ------------------------------------------------------------------
     # readout settings
     # ------------------------------------------------------------------
@@ -189,7 +219,7 @@ class CredOneController:
         need to catch one exception type.
         """
         os.makedirs(os.path.dirname(self.tmp_frame_path), exist_ok=True)
-        cmd = f"./take -N 200 -f '{self.tmp_frame_path}'"
+        cmd = f"./take -N {self.take_nbuffers} -f '{self.tmp_frame_path}'"
         stdout, stderr, rc = self._run(cmd, timeout=60)
         if rc != 0:
             msg = f"take returned rc={rc}: {stderr or stdout}"
@@ -210,8 +240,10 @@ class CredOneController:
             raise CredOneError(
                 f"Could not read frame file {self.tmp_frame_path} after 'take' "
                 f"(take stdout={stdout!r} stderr={stderr!r}). This can happen if "
-                f"the current readout mode needs different 'take' parameters "
-                f"than -N 200 -- check take's raw output above. Original error: {e}"
+                f"the current readout mode needs a different ring-buffer count "
+                f"than take_nbuffers={self.take_nbuffers} (-N {self.take_nbuffers}) "
+                f"-- check take's raw output above, and see cam.take_nbuffers in "
+                f"the config yaml if it needs adjusting. Original error: {e}"
             ) from e
 
         expected = self.FRAME_SHAPE[0] * self.FRAME_SHAPE[1]

@@ -75,6 +75,9 @@ class CredControlWidget(QWidget):
         burst_cfg = config.get("burst", {})
         self.burst_nframes_default = burst_cfg.get("nframes_default", 50)
 
+        self.cred_cfg_path = config.get("cred_cfg_path",
+                                         "~/../../usr/local/aodev/CRED-One/cred_default.cfg")
+
         self.operation_in_progress = False
         self.current_image_array = None
         self.current_burst_cube = None
@@ -146,6 +149,18 @@ class CredControlWidget(QWidget):
         mode_layout.addWidget(self.mode_dropdown)
         mode_layout.addWidget(mode_set_btn)
         control_layout.addWidget(mode_box)
+
+        # Frame grabber re-init (the README's `initcam` startup step).
+        # Worth trying if `take` starts failing with a pdv_multibuf /
+        # ring-buffer error after changing readout mode -- the board's
+        # ROI/tap config can end up stale relative to the camera's
+        # current mode.
+        reinit_box = QGroupBox("Frame Grabber")
+        reinit_layout = QVBoxLayout(reinit_box)
+        reinit_btn = QPushButton("Re-init Frame Grabber (initcam)")
+        reinit_btn.clicked.connect(self.reinit_framegrabber)
+        reinit_layout.addWidget(reinit_btn)
+        control_layout.addWidget(reinit_box)
 
         # NDR + raw images
         ndr_box = QGroupBox(f"NDR / Raw Images")
@@ -290,6 +305,25 @@ class CredControlWidget(QWidget):
         except CredOneError as e:
             self.log.error(f"Failed to set readout mode: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set readout mode:\n{e}")
+
+    def reinit_framegrabber(self):
+        reply = QMessageBox.question(
+            self, "Re-init Frame Grabber",
+            "This re-runs the frame grabber's initcam startup step and will "
+            "briefly interrupt acquisition. Only needed if 'take' is failing "
+            "(e.g. a pdv_multibuf / ring-buffer error) after changing readout "
+            "mode.\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self.log.info("Frame grabber re-init cancelled by user")
+            return
+        try:
+            raw = self.cam.reinit_framegrabber(self.cred_cfg_path)
+            self.log.info(f"Frame grabber re-initialized: {raw}")
+        except CredOneError as e:
+            self.log.error(f"Failed to re-init frame grabber: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to re-init frame grabber:\n{e}")
 
     def set_ndr(self):
         try:
@@ -574,10 +608,13 @@ if __name__ == "__main__":
 
     config = load_config()
     cam_cfg = config.get("cam", {})
+    config["cred_cfg_path"] = cam_cfg.get("cred_cfg_path",
+                                           "~/../../usr/local/aodev/CRED-One/cred_default.cfg")
     config["cam"] = CredOneController(
         edt_dir=cam_cfg.get("edt_dir", "/opt/EDTpdv"),
         tmp_frame_path=cam_cfg.get("tmp_frame_path",
                                     "/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw"),
+        take_nbuffers=cam_cfg.get("take_nbuffers", 200),
     )
 
     window = CredControlMainWindow(config)

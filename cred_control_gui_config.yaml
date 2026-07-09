@@ -1,0 +1,31 @@
+gui:
+  window_title: "C-RED ONE Control"
+  window_geometry: [100, 100, 1200, 800]
+  top_splitter_sizes: [350, 850]
+  main_splitter_sizes: [650, 150]
+
+fps:
+  range: [1, 600]
+  default: 60
+
+gain:
+  range: [0, 1000]
+  default: 1
+
+ndr:
+  range: [1, 200]
+  default: 1
+
+burst:
+  nframes_default: 50
+
+live_view:
+  interval_ms: 500
+
+logging:
+  max_lines: 300
+  font_size: 8
+
+styling:
+  use_keck_theme: true
+  font_size: 9

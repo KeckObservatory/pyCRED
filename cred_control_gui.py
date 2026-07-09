@@ -40,11 +40,12 @@ except ImportError as e:
     print("Some functionality may be limited.")
 
 # TODO: confirm the full/authoritative list of readout modes against the
-# C-RED ONE manual -- only 'globalresetbursts' is exercised in
-# cred_test_prelim.py today.
+# C-RED ONE manual. globalresetsingle is the camera's actual default mode
+# (confirmed on hardware); globalresetbursts is the only other one
+# exercised in cred_test_prelim.py.
 READOUT_MODES = [
-    "globalresetbursts",
     "globalresetsingle",
+    "globalresetbursts",
     "globalresetcds",
     "rollingresetsingle",
     "rollingresetcds",
@@ -60,8 +61,8 @@ class CredControlWidget(QWidget):
         self.cam.log = self.log
 
         fps_cfg = config.get("fps", {})
-        self.fps_range = fps_cfg.get("range", [1, 600])
-        self.fps_default = fps_cfg.get("default", 60)
+        self.fps_range = fps_cfg.get("range", [1, 3500])
+        self.fps_default = fps_cfg.get("default", 3500)
 
         gain_cfg = config.get("gain", {})
         self.gain_range = gain_cfg.get("range", [0, 1000])
@@ -324,7 +325,7 @@ class CredControlWidget(QWidget):
             frame, time_str = self.cam.get_image()
             self.display_image(frame, title=f"Single frame ({time_str})")
             self.log.info(f"Captured single image at {time_str}")
-        except CredOneError as e:
+        except Exception as e:
             self.log.error(f"Failed to capture image: {e}")
             QMessageBox.critical(self, "Error", f"Failed to capture image:\n{e}")
 
@@ -429,7 +430,7 @@ class CredControlWidget(QWidget):
         try:
             frame, time_str = self.cam.get_image()
             self.display_image(frame, title=f"Live view ({time_str})")
-        except CredOneError as e:
+        except Exception as e:
             self.log.warning(f"Live view frame failed: {e}")
 
     # ------------------------------------------------------------------

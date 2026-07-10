@@ -208,10 +208,14 @@ class CredControlWidget(QWidget):
         self.burst_nframes_input = QSpinBox()
         self.burst_nframes_input.setRange(1, 5000)
         self.burst_nframes_input.setValue(self.burst_nframes_default)
+        self.user_img_type = QComboBox()
+        self.user_img_type.addItems([".npy", ".npz"])
+        self.user_img_type.setCurrentText(".npy")
         burst_btn = QPushButton("Take Burst")
         burst_btn.clicked.connect(self.take_burst)
         burst_layout.addWidget(QLabel("N frames:"))
         burst_layout.addWidget(self.burst_nframes_input)
+        burst_layout.addWidget(self.user_img_type)
         burst_layout.addWidget(burst_btn)
         image_layout.addLayout(burst_layout)
         self.burst_btn = burst_btn
@@ -479,20 +483,25 @@ class CredControlWidget(QWidget):
             self.log.info(f"Burst capture complete. Cube shape: {cube.shape}")
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            default_filename = f"cred_burst_{timestamp}.npy"
+            user_type = self.user_img_type.currentText()
+            default_filename = f"cred_burst_{timestamp}{user_type}"
             reply = QMessageBox.question(
                 self, "Save Burst", f"Save the {nframes}-frame cube as {default_filename}?",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if reply == QMessageBox.Yes:
-                file_path, _ = QFileDialog.getSaveFileName(self, "Save Burst Cube", default_filename,
-                                                             "NumPy files (*.npy);;All files (*.*)")
-                if file_path:
-                    if not file_path.lower().endswith(".npy"):
-                        file_path += ".npy"
-                    np.save(file_path, cube)
-                    self.log.info(f"Burst cube saved as {file_path}")
-
+                if user_type == ".npy":
+                    self.save_current_image(cube, filename=default_filename, type=user_type)
+                else:
+                    hdr_dict = {}
+                    hdr_dict['NFRAMES'] = nframes
+                    hdr_dict['fps'] = self.cam.get_fps()[0]
+                    hdr_dict['gain'] = self.cam.get_gain()[0]
+                    hdr_dict['readout_mode'] = self.cam.get_readout_mode()
+                    hdr_dict['ndr'] = self.cam.get_ndr()[0]
+                    hdr_dict['temperature'] = self.cam.temperature()[0]
+                    self.save_current_image(cube, filename=default_filename, type=user_type, header_info=hdr_dict)
+  
         except Exception as e:
             self.log.error(f"Burst capture failed: {e}")
             QMessageBox.critical(self, "Error", f"Burst capture failed:\n{e}")
@@ -602,21 +611,43 @@ class CredControlWidget(QWidget):
             self.log.error(f"Failed to display image: {e}")
             QMessageBox.critical(self, "Error", f"Failed to display image:\n{e}")
 
-    def save_current_image(self):
+    def save_current_image(self, filename=None, type='.npy', header_info=None):
         if self.current_image_array is None:
             QMessageBox.warning(self, "No Image", "No image is currently displayed to save.")
             self.log.warning("Attempted to save image but no image is currently displayed")
             return
+
+        header_info = {} if header_info is None else dict(header_info)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_filename = f"cred_image_{timestamp}.npy"
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save CRED Image", default_filename,
-                                                     "NumPy files (*.npy);;All files (*.*)")
+        if filename is None:
+            default_filename = f"cred_image_{timestamp}.npy"
+        else:
+            default_filename = filename
+
+        if type == '.npz':
+            default_filename = default_filename if default_filename.lower().endswith('.npz') else f"{default_filename}.npz"
+            file_filter = "NumPy archive files (*.npz);;All files (*.*)"
+        else:
+            default_filename = default_filename if default_filename.lower().endswith('.npy') else f"{default_filename}.npy"
+            file_filter = "NumPy files (*.npy);;All files (*.*)"
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save CRED Image", default_filename, file_filter)
         if not file_path:
             self.log.info("Save operation cancelled by user")
             return
-        if not file_path.lower().endswith(".npy"):
-            file_path += ".npy"
-        np.save(file_path, self.current_image_array)
+
+        if type == '.npz':
+            if not file_path.lower().endswith(".npz"):
+                file_path += ".npz"
+            if header_info:
+                np.savez_compressed(file_path, image=self.current_image_array, header_info=np.array([header_info], dtype=object))
+            else:
+                np.savez_compressed(file_path, image=self.current_image_array)
+        else:
+            if not file_path.lower().endswith(".npy"):
+                file_path += ".npy"
+            np.save(file_path, self.current_image_array)
+
         self.log.info(f"Current image saved as {file_path}")
         QMessageBox.information(self, "Image Saved", f"Image saved successfully as:\n{file_path}")
 

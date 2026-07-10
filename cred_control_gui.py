@@ -37,7 +37,16 @@ except ImportError as e:
     print("Some functionality may be limited.")
 
 READOUT_MODES = ["globalresetsingle", "globalresetcds", "globalresetbursts"]
-IMAGE_TYPES = ["dark", "flat"]
+# Combined type+format choice for the save prompt: display string ->
+# (subfolder, save_type). Folder is still just "dark"/"flat" -- the
+# format is folded into a single choice so it can't be forgotten
+# separately from the type.
+SAVE_OPTIONS = {
+    "dark (.npy)": ("dark", ".npy"),
+    "dark (.npz)": ("dark", ".npz"),
+    "flat (.npy)": ("flat", ".npy"),
+    "flat (.npz)": ("flat", ".npz"),
+}
 
 
 class CredControlWidget(QWidget):
@@ -188,7 +197,6 @@ class CredControlWidget(QWidget):
         self.live_view_checkbox.stateChanged.connect(self.toggle_live_view)
         image_layout.addWidget(self.live_view_checkbox)
 
-        save_layout = QHBoxLayout()
         save_btn = QPushButton("Save Current Image")
         save_btn.setStyleSheet("""
             QPushButton { background-color: #0ABAB5; color: white; border: 2px solid #7FFFD4;
@@ -197,13 +205,7 @@ class CredControlWidget(QWidget):
             QPushButton:pressed { background-color: #008B8B; }
         """)
         save_btn.clicked.connect(self.save_current_image)
-        self.save_type_dropdown = QComboBox()
-        self.save_type_dropdown.addItems([".npy", ".npz"])
-        self.save_type_dropdown.setToolTip(
-            ".npy: image only. .npz: image + mode/gain/fps/ndr/temperature/pressure.")
-        save_layout.addWidget(save_btn, 1)
-        save_layout.addWidget(self.save_type_dropdown, 0)
-        image_layout.addLayout(save_layout)
+        image_layout.addWidget(save_btn)
 
         control_layout.addWidget(image_box)
         control_layout.addStretch()
@@ -474,15 +476,16 @@ class CredControlWidget(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to display image:\n{e}")
 
     def _choose_type_and_save(self, array, extra_meta=None):
-        """Ask dark/flat, then save into that subfolder. Returns the
-        saved path, or None if cancelled/failed (already logged/shown)."""
-        image_type, ok = QInputDialog.getItem(
-            self, "Image Type", "Save as:", IMAGE_TYPES, 0, False)
+        """Ask dark/flat + format in one combined prompt, then save into
+        that subfolder. Returns the saved path, or None if
+        cancelled/failed (already logged/shown)."""
+        choice, ok = QInputDialog.getItem(
+            self, "Save Image", "Save as:", list(SAVE_OPTIONS.keys()), 0, False)
         if not ok:
             self.log.info("Save cancelled at type selection")
             return None
+        image_type, save_type = SAVE_OPTIONS[choice]
 
-        save_type = self.save_type_dropdown.currentText()
         try:
             path = self.cam.save_image(array, self.data_root, save_type=save_type,
                                         extra_meta=extra_meta, subfolder=image_type)

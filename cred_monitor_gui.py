@@ -3,7 +3,6 @@ import os
 
 import yaml
 from pathlib import Path
-from collections import deque
 from datetime import datetime
 
 from PyQt5 import QtWidgets, QtGui, QtCore
@@ -15,7 +14,25 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
                               QMainWindow, QMessageBox)
 
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+
+
+class SafeFigureCanvas(FigureCanvas):
+    """FigureCanvasQTAgg, but ignores resize events with a non-positive
+    width/height instead of crashing. Qt can legitimately deliver a
+    transient invalid size during layout renegotiation -- e.g. right
+    after toggling a splitter panel's visibility while the window is
+    near its minimum width -- and matplotlib's default resizeEvent
+    raises outright on that rather than ignoring it. Confirmed this
+    isn't just a headless-testing artifact: reproduced under both the
+    offscreen QPA platform and real Xvfb X11."""
+
+    def resizeEvent(self, event):
+        size = event.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+        super().resizeEvent(event)
 from matplotlib.figure import Figure
 
 # --- local project paths ---------------------------------------------------
@@ -68,10 +85,12 @@ class CredMonitorWidget(QWidget):
         # than stacking up calls.
         self._polling = False
 
-        # History buffers for the temperature/pressure plots
-        self.temp_history = {}  # {sensor_name: deque}
-        self.pressure_history = deque(maxlen=self.max_history_points)
-        self.time_history = deque(maxlen=self.max_history_points)
+        # Full history for the life of the session -- no truncation. Not
+        # bounded by max_history_points; that config value is unused now
+        # (kept in the yaml for backward compat, harmless if present).
+        self.temp_history = {}  # {sensor_name: [values]}
+        self.pressure_history = []
+        self.time_history = []
 
         self.setupUI()
 
@@ -187,7 +206,7 @@ class CredMonitorWidget(QWidget):
         PLOT_FG = "white"
 
         self.display_widget = QWidget()
-        self.display_widget.setMinimumWidth(600)
+        self.display_widget.setMinimumWidth(0)  # widened to 600 by toggle_show_plots() when shown
         self.display_widget.setMinimumHeight(500)
         self.display_widget.setVisible(False)
         display_layout = QVBoxLayout(self.display_widget)
@@ -198,7 +217,7 @@ class CredMonitorWidget(QWidget):
         # Only cryopt (pulse tube) and cryod (diode) are plotted here,
         # even if other sensors show up in the readout table above.
         self.figure = Figure(figsize=(6, 6), dpi=100, facecolor=PLOT_BG)
-        self.canvas = FigureCanvas(self.figure)
+        self.canvas = SafeFigureCanvas(self.figure)
         self.axes_temp = self.figure.add_subplot(211)
         self.axes_pressure = self.figure.add_subplot(212, sharex=self.axes_temp)
         self._style_dark_axes(self.axes_temp, "Temperature (K)", "Temperature History")
@@ -209,6 +228,7 @@ class CredMonitorWidget(QWidget):
         top_splitter.addWidget(control_panel)
         top_splitter.addWidget(self.display_widget)
         top_splitter.setSizes(self.config.get("gui", {}).get("top_splitter_sizes", [350, 850]))
+        self.top_splitter = top_splitter
         top_splitter.setStretchFactor(0, 0)
         top_splitter.setStretchFactor(1, 1)
 
@@ -245,9 +265,30 @@ class CredMonitorWidget(QWidget):
         show = state == 2  # Qt.Checked
         self.display_widget.setVisible(show)
         if show:
+            self.display_widget.setMinimumWidth(600)
+            # Also widen the window's own floor back up -- otherwise a
+            # window that was shrunk while plots were hidden can end up
+            # narrower than this panel's new minimum, which produces a
+            # transient negative size during layout that crashes
+            # matplotlib's canvas resize handling. setMinimumWidth alone
+            # isn't reliably synchronous, so force it with resize() too.
+            top_window = self.window()
+            top_window.setMinimumWidth(1000)
+            if top_window.width() < 1000:
+                top_window.resize(1000, top_window.height())
+            # Set the split explicitly rather than letting the splitter
+            # renegotiate proportions on its own -- under some resize
+            # sequences that renegotiation transiently allocates a
+            # negative width to this pane, which crashes matplotlib's
+            # canvas resize handler.
+            self.top_splitter.setSizes([350, 850])
             # Panel was just revealed -- draw immediately rather than
             # waiting for the next poll, so it's not blank/stale.
             self._redraw_history_plots()
+        else:
+            self.display_widget.setMinimumWidth(0)
+            self.window().setMinimumWidth(380)
+            self.top_splitter.setSizes([1, 0])
 
     # ------------------------------------------------------------------
     # Polling
@@ -291,7 +332,7 @@ class CredMonitorWidget(QWidget):
             self._ensure_temp_rows(parsed.keys())
             for name, value in parsed.items():
                 self.temp_value_labels[name].setText(f"{value:.1f}")
-                self.temp_history.setdefault(name, deque(maxlen=self.max_history_points)).append(value)
+                self.temp_history.setdefault(name, []).append(value)
 
             if not parsed:
                 self.log.warning(f"Could not parse temperature output, raw: {raw!r}")
@@ -363,6 +404,9 @@ class CredMonitorWidget(QWidget):
             if plot_values:
                 self.axes_pressure.plot(plot_times, plot_values, marker="o", markersize=2, color="#f1c40f")
 
+        time_formatter = mdates.DateFormatter("%H:%M:%S")
+        self.axes_temp.xaxis.set_major_formatter(time_formatter)
+        self.axes_pressure.xaxis.set_major_formatter(time_formatter)
         self.figure.autofmt_xdate()
         self.canvas.draw()
 
@@ -404,7 +448,10 @@ class CredMonitorMainWindow(QMainWindow):
 
         geom = config.get("gui", {}).get("window_geometry", [100, 100, 1200, 800])
         self.setGeometry(*geom)
-        self.setMinimumSize(1000, 700)
+        # Not tied to the plot panel's width -- that's added back
+        # dynamically by toggle_show_plots() only when actually visible,
+        # so hiding the plots lets the window shrink narrower too.
+        self.setMinimumSize(380, 500)
 
         if self.config.get("styling", {}).get("use_keck_theme", True):
             try:

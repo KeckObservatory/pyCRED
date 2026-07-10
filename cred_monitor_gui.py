@@ -1,27 +1,27 @@
 import sys
 import os
-import threading
-import time
 
-import numpy as np
 import yaml
 from pathlib import Path
+from collections import deque
 from datetime import datetime
 
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
                               QGroupBox, QPushButton, QCheckBox, QLabel,
-                              QSpinBox, QDoubleSpinBox, QGridLayout,
+                              QSpinBox, QGridLayout, QFrame,
                               QComboBox, QApplication, QSizePolicy,
-                              QMainWindow, QMessageBox, QProgressBar, QInputDialog)
+                              QMainWindow, QMessageBox)
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 
 # --- local project paths ---------------------------------------------------
+# Adjust these to match wherever cred_controller.py / pyCRED live in your
+# environment (mirrors the sys.path.insert block at the top of the DM
+# reception test script).
 script_dir = Path(__file__).parent.absolute()
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
@@ -36,11 +36,19 @@ except ImportError as e:
     print(f"Warning: Could not import required modules: {e}")
     print("Some functionality may be limited.")
 
-READOUT_MODES = ["globalresetsingle", "globalresetbursts"]
-IMAGE_TYPES = ["dark", "flat"]
+
+# Status tokens -> (display label, color). Extend/confirm this list against
+# the C-RED ONE user manual -- these are the tokens the README calls out
+# ('ready', 'isbeingcooled', 'operational') plus a generic error fallback.
+STATUS_COLORS = {
+    "operational": "#2ecc71",
+    "isbeingcooled": "#f1c40f",
+    "ready": "#3498db",
+}
+STATUS_DEFAULT_COLOR = "#e74c3c"
 
 
-class CredControlWidget(QWidget):
+class CredMonitorWidget(QWidget):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -48,34 +56,28 @@ class CredControlWidget(QWidget):
         self.log = config.get("logger", setup_logger())
         self.cam.log = self.log
 
-        fps_cfg = config.get("fps", {})
-        self.fps_range = fps_cfg.get("range", [1, 3500])
-        self.fps_default = fps_cfg.get("default", 3500)
+        self.auto_refresh_enabled = True
+        self.refresh_interval = config.get("monitor", {}).get("refresh_interval_ms", 2000)
+        self.max_history_points = config.get("monitor", {}).get("max_history_points", 600)
 
-        gain_cfg = config.get("gain", {})
-        self.gain_range = gain_cfg.get("range", [0, 1000])
-        self.gain_default = gain_cfg.get("default", 1)
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.refresh_status)
+        # Guard against overlapping polls: each serial_cmd call blocks the
+        # Qt event loop for its duration, so if the interval is pushed
+        # tighter than the round-trip time of a poll, skip a tick rather
+        # than stacking up calls.
+        self._polling = False
 
-        ndr_cfg = config.get("ndr", {})
-        self.ndr_range = ndr_cfg.get("range", [1, 200])
-        self.ndr_default = ndr_cfg.get("default", 1)
-
-        burst_cfg = config.get("burst", {})
-        self.burst_nframes_default = burst_cfg.get("nframes_default", 50)
-
-        # Where "Save Current Image" writes to: <data_root>/<YYYYMMDD>/
-        self.data_root = config.get("data_root", "/usr/local/aodev/CRED-One/Data")
-
-        self.operation_in_progress = False
-        self.current_image_array = None
-        self.current_capture_meta = {}
-        self.live_view_enabled = False
-        self.live_view_interval = config.get("live_view", {}).get("interval_ms", 500)
-        self.live_view_timer = QTimer()
-        self.live_view_timer.timeout.connect(self.live_view_tick)
+        # History buffers for the temperature/pressure plots
+        self.temp_history = {}  # {sensor_name: deque}
+        self.pressure_history = deque(maxlen=self.max_history_points)
+        self.time_history = deque(maxlen=self.max_history_points)
 
         self.setupUI()
-        self.display_placeholder_image()
+
+        if self.auto_refresh_enabled:
+            self.refresh_timer.start(self.refresh_interval)
+            self.refresh_status()
 
     # ------------------------------------------------------------------
     def setupUI(self):
@@ -89,134 +91,119 @@ class CredControlWidget(QWidget):
         top_widget = QWidget()
         top_layout = QHBoxLayout(top_widget)
         top_layout.setContentsMargins(0, 0, 0, 0)
+
         top_splitter = QSplitter(QtCore.Qt.Horizontal)
         top_layout.addWidget(top_splitter)
 
-        # ---------------- Left panel: controls -----------------------------
+        # ---------------- Left panel: controls + readouts ----------------
         control_panel = QWidget()
         control_layout = QVBoxLayout(control_panel)
         control_layout.setContentsMargins(5, 5, 5, 5)
 
-        # FPS
-        fps_box = QGroupBox(f"Frame Rate ({self.fps_range[0]}-{self.fps_range[1]} Hz)")
-        fps_layout = QHBoxLayout(fps_box)
-        self.fps_input = QDoubleSpinBox()
-        self.fps_input.setRange(*self.fps_range)
-        self.fps_input.setValue(self.fps_default)
-        fps_get_btn = QPushButton("Get")
-        fps_get_btn.clicked.connect(self.get_fps)
-        fps_set_btn = QPushButton("Set")
-        fps_set_btn.clicked.connect(self.set_fps)
-        fps_layout.addWidget(self.fps_input)
-        fps_layout.addWidget(fps_get_btn)
-        fps_layout.addWidget(fps_set_btn)
-        control_layout.addWidget(fps_box)
+        # Status indicator
+        status_box = QGroupBox("Camera Status / Health")
+        status_layout = QVBoxLayout(status_box)
+        self.status_indicator = QFrame()
+        self.status_indicator.setFixedHeight(28)
+        self.status_indicator.setStyleSheet(f"background-color: {STATUS_DEFAULT_COLOR}; border-radius: 4px;")
+        self.status_label = QLabel("Unknown")
+        self.status_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.status_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self.status_raw_label = QLabel("")
+        self.status_raw_label.setWordWrap(True)
+        self.status_raw_label.setStyleSheet("color: gray; font-size: 10px;")
+        status_layout.addWidget(self.status_indicator)
+        status_layout.addWidget(self.status_label)
+        status_layout.addWidget(self.status_raw_label)
+        control_layout.addWidget(status_box)
 
-        # Gain
-        gain_box = QGroupBox(f"Gain ({self.gain_range[0]}-{self.gain_range[1]})")
-        gain_layout = QHBoxLayout(gain_box)
-        self.gain_input = QDoubleSpinBox()
-        self.gain_input.setRange(*self.gain_range)
-        self.gain_input.setValue(self.gain_default)
-        gain_get_btn = QPushButton("Get")
-        gain_get_btn.clicked.connect(self.get_gain)
-        gain_set_btn = QPushButton("Set")
-        gain_set_btn.clicked.connect(self.set_gain)
-        gain_layout.addWidget(self.gain_input)
-        gain_layout.addWidget(gain_get_btn)
-        gain_layout.addWidget(gain_set_btn)
-        control_layout.addWidget(gain_box)
+        # Cooling controls
+        cooling_box = QGroupBox("Cooling")
+        cooling_layout = QHBoxLayout(cooling_box)
+        cooling_on_btn = QPushButton("Cooling ON")
+        cooling_on_btn.clicked.connect(lambda: self.set_cooling(True))
+        cooling_off_btn = QPushButton("Cooling OFF")
+        cooling_off_btn.clicked.connect(lambda: self.set_cooling(False))
+        cooling_layout.addWidget(cooling_on_btn)
+        cooling_layout.addWidget(cooling_off_btn)
+        control_layout.addWidget(cooling_box)
 
-        # Readout mode
-        mode_box = QGroupBox("Readout Mode")
-        mode_layout = QHBoxLayout(mode_box)
-        self.mode_dropdown = QComboBox()
-        self.mode_dropdown.addItems(READOUT_MODES)
-        mode_set_btn = QPushButton("Set")
-        mode_set_btn.clicked.connect(self.set_readout_mode)
-        mode_layout.addWidget(self.mode_dropdown)
-        mode_layout.addWidget(mode_set_btn)
-        control_layout.addWidget(mode_box)
+        # Temperature readout table
+        temp_box = QGroupBox("Temperature (K)")
+        self.temp_grid = QGridLayout(temp_box)
+        self.temp_value_labels = {}  # populated dynamically as sensors appear
+        control_layout.addWidget(temp_box)
+        self.temp_box = temp_box
 
-        # NDR + raw images
-        ndr_box = QGroupBox("NDR / Raw Images")
-        ndr_layout = QGridLayout(ndr_box)
-        self.ndr_input = QSpinBox()
-        self.ndr_input.setRange(*self.ndr_range)
-        self.ndr_input.setValue(self.ndr_default)
-        ndr_set_btn = QPushButton("Set NDR")
-        ndr_set_btn.clicked.connect(self.set_ndr)
-        self.rawimages_dropdown = QComboBox()
-        self.rawimages_dropdown.addItems(["Off", "On"])
-        rawimages_set_btn = QPushButton("Set Raw Images")
-        rawimages_set_btn.clicked.connect(self.set_rawimages)
-        ndr_layout.addWidget(QLabel("NDR:"), 0, 0)
-        ndr_layout.addWidget(self.ndr_input, 0, 1)
-        ndr_layout.addWidget(ndr_set_btn, 0, 2)
-        ndr_layout.addWidget(QLabel("Raw images:"), 1, 0)
-        ndr_layout.addWidget(self.rawimages_dropdown, 1, 1)
-        ndr_layout.addWidget(rawimages_set_btn, 1, 2)
-        control_layout.addWidget(ndr_box)
+        # Pressure readout
+        pressure_box = QGroupBox("Pressure")
+        pressure_layout = QVBoxLayout(pressure_box)
+        self.pressure_label = QLabel("--")
+        self.pressure_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.pressure_raw_label = QLabel("")
+        self.pressure_raw_label.setWordWrap(True)
+        self.pressure_raw_label.setStyleSheet("color: gray; font-size: 10px;")
+        pressure_layout.addWidget(self.pressure_label)
+        pressure_layout.addWidget(self.pressure_raw_label)
+        control_layout.addWidget(pressure_box)
 
-        # Imaging
-        image_box = QGroupBox("Imaging")
-        image_layout = QVBoxLayout(image_box)
+        # Refresh controls
+        refresh_box = QGroupBox("Auto Refresh")
+        refresh_layout = QGridLayout(refresh_box)
+        self.auto_refresh_checkbox = QCheckBox("Enabled")
+        self.auto_refresh_checkbox.setChecked(self.auto_refresh_enabled)
+        self.auto_refresh_checkbox.stateChanged.connect(self.toggle_auto_refresh)
+        interval_label = QLabel("Interval (s):")
+        self.interval_spinbox = QSpinBox()
+        self.interval_spinbox.setRange(1, 300)
+        self.interval_spinbox.setValue(self.refresh_interval // 1000)
+        self.interval_spinbox.valueChanged.connect(self.update_refresh_interval)
+        manual_refresh_btn = QPushButton("Refresh Now")
+        manual_refresh_btn.clicked.connect(self.refresh_status)
+        refresh_layout.addWidget(self.auto_refresh_checkbox, 0, 0, 1, 2)
+        refresh_layout.addWidget(interval_label, 1, 0)
+        refresh_layout.addWidget(self.interval_spinbox, 1, 1)
+        refresh_layout.addWidget(manual_refresh_btn, 2, 0, 1, 2)
+        control_layout.addWidget(refresh_box)
 
-        single_btn = QPushButton("Take Single Image")
-        single_btn.clicked.connect(self.take_single_image)
-        image_layout.addWidget(single_btn)
+        # Optional history-plot display. Off by default -- most of the
+        # time the live readouts above are all that's needed; this is for
+        # visually watching a cooldown/warmup progress over time.
+        display_box = QGroupBox("Display")
+        display_box_layout = QVBoxLayout(display_box)
+        self.show_plots_checkbox = QCheckBox("Show History Plots")
+        self.show_plots_checkbox.setChecked(False)
+        self.show_plots_checkbox.stateChanged.connect(self.toggle_show_plots)
+        display_box_layout.addWidget(self.show_plots_checkbox)
+        control_layout.addWidget(display_box)
 
-        burst_layout = QHBoxLayout()
-        self.burst_nframes_input = QSpinBox()
-        self.burst_nframes_input.setRange(1, 5000)
-        self.burst_nframes_input.setValue(self.burst_nframes_default)
-        burst_btn = QPushButton("Take Burst")
-        burst_btn.clicked.connect(self.take_burst)
-        burst_layout.addWidget(QLabel("N frames:"))
-        burst_layout.addWidget(self.burst_nframes_input)
-        burst_layout.addWidget(burst_btn)
-        image_layout.addLayout(burst_layout)
-
-        self.live_view_checkbox = QCheckBox("Live View")
-        self.live_view_checkbox.stateChanged.connect(self.toggle_live_view)
-        image_layout.addWidget(self.live_view_checkbox)
-
-        save_layout = QHBoxLayout()
-        save_btn = QPushButton("Save Current Image")
-        save_btn.setStyleSheet("""
-            QPushButton { background-color: #0ABAB5; color: white; border: 2px solid #7FFFD4;
-                          border-radius: 5px; padding: 8px 16px; font-weight: bold; }
-            QPushButton:hover { background-color: #40E0D0; }
-            QPushButton:pressed { background-color: #008B8B; }
-        """)
-        save_btn.clicked.connect(self.save_current_image)
-        self.save_type_dropdown = QComboBox()
-        self.save_type_dropdown.addItems([".npy", ".npz"])
-        self.save_type_dropdown.setToolTip(
-            ".npy: image only. .npz: image + mode/gain/fps/ndr/temperature/pressure.")
-        save_layout.addWidget(save_btn, 1)
-        save_layout.addWidget(self.save_type_dropdown, 0)
-        image_layout.addLayout(save_layout)
-
-        control_layout.addWidget(image_box)
         control_layout.addStretch()
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        control_layout.addWidget(self.progress_bar)
+        # ---------------- Right panel: temperature-history plot ----------
+        # Dark-themed to match the rest of the GUI; hidden by default
+        # (toggled via the "Show History Plots" checkbox above) since not
+        # everyone needs the visual trend, just the live numbers.
+        PLOT_BG = "#1e1e1e"
+        PLOT_FG = "white"
 
-        # ---------------- Right panel: image display ------------------------
         self.display_widget = QWidget()
         self.display_widget.setMinimumWidth(600)
         self.display_widget.setMinimumHeight(500)
-        self.display_widget.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
+        self.display_widget.setVisible(False)
         display_layout = QVBoxLayout(self.display_widget)
 
-        self.figure = Figure(figsize=(6, 6), dpi=100, facecolor="black")
+        # Two stacked subplots sharing the time axis: temperature on top,
+        # pressure below. Both update on every poll for a near-continuous
+        # readout -- handy for watching a cooldown/warmup in progress.
+        # Only cryopt (pulse tube) and cryod (diode) are plotted here,
+        # even if other sensors show up in the readout table above.
+        self.figure = Figure(figsize=(6, 6), dpi=100, facecolor=PLOT_BG)
         self.canvas = FigureCanvas(self.figure)
-        self.axes = self.figure.add_subplot(111)
-        self.toolbar = NavigationToolbar(self.canvas, self.display_widget)
-        display_layout.addWidget(self.toolbar)
+        self.axes_temp = self.figure.add_subplot(211)
+        self.axes_pressure = self.figure.add_subplot(212, sharex=self.axes_temp)
+        self._style_dark_axes(self.axes_temp, "Temperature (K)", "Temperature History")
+        self._style_dark_axes(self.axes_pressure, "Pressure", "Pressure History", xlabel="Time")
+        self.figure.tight_layout()
         display_layout.addWidget(self.canvas)
 
         top_splitter.addWidget(control_panel)
@@ -225,10 +212,10 @@ class CredControlWidget(QWidget):
         top_splitter.setStretchFactor(0, 0)
         top_splitter.setStretchFactor(1, 1)
 
-        # ---------------- Bottom: logger -------------------------------------
+        # ---------------- Bottom: logger -----------------------------------
         logger_config = self.config.get("logging", {})
         self.logger_widget = LoggerWidget(
-            name="CRED Control Log",
+            name="CRED Monitor Log",
             max_lines=logger_config.get("max_lines", 300),
             min_height=100,
             font_size=logger_config.get("font_size", 8),
@@ -241,278 +228,179 @@ class CredControlWidget(QWidget):
         main_splitter.setCollapsible(1, True)
         main_splitter.setSizes(self.config.get("gui", {}).get("main_splitter_sizes", [650, 150]))
 
-    # ------------------------------------------------------------------
-    # Settings actions
-    # ------------------------------------------------------------------
-    def get_fps(self):
-        try:
-            value, raw = self.cam.get_fps()
-            if value is not None:
-                self.fps_input.setValue(value)
-            self.log.info(f"FPS: {raw}")
-        except CredOneError as e:
-            self.log.error(f"Failed to get FPS: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to get FPS:\n{e}")
+    def _style_dark_axes(self, ax, ylabel, title, xlabel=None):
+        """Apply consistent dark styling to a plot axes. Must be re-applied
+        after every ax.clear() call since clear() resets styling too."""
+        ax.set_facecolor("#1e1e1e")
+        ax.set_ylabel(ylabel, color="white")
+        ax.set_title(title, color="white")
+        if xlabel:
+            ax.set_xlabel(xlabel, color="white")
+        ax.tick_params(colors="white", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#666666")
+        ax.grid(True, color="#444444", linewidth=0.5, alpha=0.6)
 
-    def set_fps(self):
-        try:
-            raw = self.cam.set_fps(self.fps_input.value())
-            self.log.info(f"Set FPS to {self.fps_input.value()}: {raw}")
-        except CredOneError as e:
-            self.log.error(f"Failed to set FPS: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set FPS:\n{e}")
-
-    def get_gain(self):
-        try:
-            value, raw = self.cam.get_gain()
-            if value is not None:
-                self.gain_input.setValue(value)
-            self.log.info(f"Gain: {raw}")
-        except CredOneError as e:
-            self.log.error(f"Failed to get gain: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to get gain:\n{e}")
-
-    def set_gain(self):
-        try:
-            raw = self.cam.set_gain(self.gain_input.value())
-            self.log.info(f"Set gain to {self.gain_input.value()}: {raw}")
-        except CredOneError as e:
-            self.log.error(f"Failed to set gain: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set gain:\n{e}")
-
-    def set_readout_mode(self):
-        mode = self.mode_dropdown.currentText()
-        try:
-            raw = self.cam.set_readout_mode(mode)
-            self.log.info(f"Set readout mode to {mode}: {raw}")
-        except CredOneError as e:
-            self.log.error(f"Failed to set readout mode: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set readout mode:\n{e}")
-
-    def set_ndr(self):
-        try:
-            raw = self.cam.set_ndr(self.ndr_input.value())
-            self.log.info(f"Set NDR to {self.ndr_input.value()}: {raw}")
-        except CredOneError as e:
-            self.log.error(f"Failed to set NDR: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set NDR:\n{e}")
-
-    def set_rawimages(self):
-        on = self.rawimages_dropdown.currentText() == "On"
-        try:
-            raw = self.cam.set_rawimages(on)
-            self.log.info(f"Set raw images {'On' if on else 'Off'}: {raw}")
-        except CredOneError as e:
-            self.log.error(f"Failed to set raw images: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set raw images:\n{e}")
+    def toggle_show_plots(self, state):
+        show = state == 2  # Qt.Checked
+        self.display_widget.setVisible(show)
+        if show:
+            # Panel was just revealed -- draw immediately rather than
+            # waiting for the next poll, so it's not blank/stale.
+            self._redraw_history_plots()
 
     # ------------------------------------------------------------------
-    # Imaging actions
+    # Polling
     # ------------------------------------------------------------------
-    def set_buttons_enabled(self, enabled):
-        for widget in self.findChildren(QPushButton):
-            if widget.text() == "Save Current Image":
-                continue
-            widget.setEnabled(enabled)
-
-    def take_single_image(self):
-        if self.operation_in_progress:
-            QMessageBox.warning(self, "Operation in Progress", "Another operation is already running.")
+    def refresh_status(self):
+        if self._polling:
+            # Previous poll (serial_cmd round-trip) hasn't returned yet --
+            # skip this tick instead of piling up overlapping calls.
+            self.log.debug("Skipping refresh tick, previous poll still in flight")
             return
+        self._polling = True
         try:
-            frame, time_str = self.cam.get_image()
-            self.display_image(frame, title=f"Single frame ({time_str})")
-            self.current_capture_meta = {"nframes": 1}
-            self.log.info(f"Captured single image at {time_str}")
-            self._prompt_save_then_type(frame, extra_meta=self.current_capture_meta)
-        except Exception as e:
-            self.log.error(f"Failed to capture image: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to capture image:\n{e}")
-
-    def take_burst(self):
-        if self.operation_in_progress:
-            QMessageBox.warning(self, "Operation in Progress", "Another operation is already running.")
-            return
-
-        nframes = self.burst_nframes_input.value()
-        reply = QMessageBox.question(
-            self, "Take Burst",
-            f"Capture {nframes} sequential frames? This may take a while "
-            f"since each frame is grabbed individually.\n\nContinue?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            self.log.info("Burst capture cancelled by user")
-            return
-
-        try:
-            self.operation_in_progress = True
-            self.set_buttons_enabled(False)
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setRange(0, 0)
-            self.log.info(f"Starting burst capture of {nframes} frames...")
-            QApplication.processEvents()
-
-            cube = self.run_with_gui_updates(self.cam.get_image_multiframe, nframes)
-
-            median_frame = np.median(cube, axis=0)
-            self.display_image(median_frame, title=f"Burst median ({nframes} frames)")
-            self.current_capture_meta = {"nframes": nframes}
-            self.log.info(f"Burst capture complete. Cube shape: {cube.shape}")
-            self._prompt_save_then_type(cube, extra_meta=self.current_capture_meta)
-
-        except Exception as e:
-            self.log.error(f"Burst capture failed: {e}")
-            QMessageBox.critical(self, "Error", f"Burst capture failed:\n{e}")
+            now = datetime.now()
+            self.time_history.append(now)
+            self.refresh_temperature(now)
+            self.refresh_pressure(now)
+            self.refresh_camera_status()
+            if self.display_widget.isVisible():
+                self._redraw_history_plots()
         finally:
-            self.operation_in_progress = False
-            self.progress_bar.setVisible(False)
-            self.set_buttons_enabled(True)
+            self._polling = False
 
-    def run_with_gui_updates(self, func, *args, **kwargs):
-        """Run func in a background thread while keeping the GUI responsive."""
-        self.function_complete = False
-        self.function_error = None
-        self.function_result = None
-        last_log_time = time.time()
-
-        def run_function():
-            try:
-                self.function_result = func(*args, **kwargs)
-            except Exception as e:
-                self.function_error = e
-            finally:
-                self.function_complete = True
-
-        thread = threading.Thread(target=run_function)
-        thread.daemon = True
-        thread.start()
-
-        while not self.function_complete:
-            QApplication.processEvents()
-            if time.time() - last_log_time > 30:
-                self.log.info("Operation in progress...")
-                last_log_time = time.time()
-            time.sleep(0.1)
-
-        thread.join()
-        if self.function_error:
-            raise self.function_error
-        return self.function_result
-
-    def toggle_live_view(self, state):
-        self.live_view_enabled = state == 2  # Qt.Checked
-        if self.live_view_enabled:
-            self.live_view_timer.start(self.live_view_interval)
-            self.log.info("Live view started")
-        else:
-            self.live_view_timer.stop()
-            self.log.info("Live view stopped")
-
-    def live_view_tick(self):
-        if self.operation_in_progress:
-            return
+    def refresh_camera_status(self):
         try:
-            frame, time_str = self.cam.get_image()
-            self.display_image(frame, title=f"Live view ({time_str})")
-            self.current_capture_meta = {"nframes": 1}
-        except Exception as e:
-            self.log.warning(f"Live view frame failed: {e}")
+            raw = self.cam.get_status()
+            self.status_raw_label.setText(raw)
+            token = next((t for t in STATUS_COLORS if t in raw.lower()), None)
+            color = STATUS_COLORS.get(token, STATUS_DEFAULT_COLOR)
+            label = token if token else "Unknown / check log"
+            self.status_label.setText(label.capitalize())
+            self.status_indicator.setStyleSheet(f"background-color: {color}; border-radius: 4px;")
+        except CredOneError as e:
+            self.status_label.setText("Error")
+            self.status_indicator.setStyleSheet(f"background-color: {STATUS_DEFAULT_COLOR}; border-radius: 4px;")
+            self.status_raw_label.setText(str(e))
+            self.log.error(f"Failed to get camera status: {e}")
 
-    # ------------------------------------------------------------------
-    # Display / save
-    # ------------------------------------------------------------------
-    def display_placeholder_image(self):
-        self.axes.clear()
-        self.axes.set_facecolor("black")
-        self.figure.patch.set_facecolor("black")
-        self.axes.text(0.5, 0.5, "C-RED ONE Display", ha="center", va="center",
-                        transform=self.axes.transAxes, fontsize=14, color="white",
-                        fontweight="bold")
-        self.axes.set_xlim(0, 1)
-        self.axes.set_ylim(0, 1)
-        self.axes.set_xticks([])
-        self.axes.set_yticks([])
+    def refresh_temperature(self, now):
+        try:
+            raw, parsed = self.cam.get_temperature()
+            self._ensure_temp_rows(parsed.keys())
+            for name, value in parsed.items():
+                self.temp_value_labels[name].setText(f"{value:.1f}")
+                self.temp_history.setdefault(name, deque(maxlen=self.max_history_points)).append(value)
+
+            if not parsed:
+                self.log.warning(f"Could not parse temperature output, raw: {raw!r}")
+        except CredOneError as e:
+            self.log.error(f"Failed to get temperature: {e}")
+
+    def refresh_pressure(self, now):
+        try:
+            raw, value = self.cam.get_pressure()
+            self.pressure_label.setText(f"{value:.3g}" if value is not None else "--")
+            self.pressure_raw_label.setText(raw)
+            self.pressure_history.append(value)
+        except CredOneError as e:
+            self.pressure_label.setText("Error")
+            self.pressure_raw_label.setText(str(e))
+            self.pressure_history.append(None)
+            self.log.error(f"Failed to get pressure: {e}")
+
+    def _ensure_temp_rows(self, sensor_names):
+        """Add a grid row for any newly-seen temperature sensor name."""
+        for name in sensor_names:
+            if name in self.temp_value_labels:
+                continue
+            row = self.temp_grid.rowCount()
+            name_label = QLabel(name)
+            value_label = QLabel("--")
+            value_label.setStyleSheet("font-weight: bold;")
+            self.temp_grid.addWidget(name_label, row, 0)
+            self.temp_grid.addWidget(value_label, row, 1)
+            self.temp_value_labels[name] = value_label
+
+    # Only these two sensors get plotted (even if the readout table above
+    # shows others) -- matched by substring since exact key formatting
+    # from get_temperature()'s parser hasn't been confirmed on hardware.
+    # Fixed colors chosen for visibility against the dark background.
+    TEMP_PLOT_SENSORS = {"cryopt": "#00d4ff", "cryod": "#ff6ec7"}
+
+    def _redraw_history_plots(self):
+        times = list(self.time_history)
+
+        self.axes_temp.clear()
+        self._style_dark_axes(self.axes_temp, "Temperature (K)", "Temperature History")
+        plotted_any = False
+        for name, values in self.temp_history.items():
+            match = next((key for key in self.TEMP_PLOT_SENSORS if key in name.lower()), None)
+            if match is None:
+                continue
+            values = list(values)
+            n = min(len(times), len(values))
+            if n == 0:
+                continue
+            self.axes_temp.plot(times[-n:], values[-n:], marker="o", markersize=2,
+                                 label=name, color=self.TEMP_PLOT_SENSORS[match])
+            plotted_any = True
+        if plotted_any:
+            legend = self.axes_temp.legend(loc="upper right", fontsize=8, facecolor="#1e1e1e")
+            for text in legend.get_texts():
+                text.set_color("white")
+
+        self.axes_pressure.clear()
+        self._style_dark_axes(self.axes_pressure, "Pressure", "Pressure History", xlabel="Time")
+        pressure_values = list(self.pressure_history)
+        n = min(len(times), len(pressure_values))
+        if n > 0:
+            # Plot only points where a value was actually parsed; gaps
+            # (None) show up as breaks in the line rather than zeros.
+            plot_times = [t for t, v in zip(times[-n:], pressure_values[-n:]) if v is not None]
+            plot_values = [v for v in pressure_values[-n:] if v is not None]
+            if plot_values:
+                self.axes_pressure.plot(plot_times, plot_values, marker="o", markersize=2, color="#f1c40f")
+
+        self.figure.autofmt_xdate()
         self.canvas.draw()
 
-    def display_image(self, image_array, title=""):
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+    def set_cooling(self, on):
         try:
-            self.current_image_array = image_array.copy()
+            self.cam.set_cooling(on)
+            self.log.info(f"Cooling set {'ON' if on else 'OFF'}")
+            self.refresh_camera_status()
+        except CredOneError as e:
+            self.log.error(f"Failed to set cooling: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to set cooling:\n{e}")
 
-            self.figure.clear()
-            self.axes = self.figure.add_subplot(111)
-            self.figure.patch.set_facecolor("black")
-            self.axes.set_facecolor("black")
-            for spine in self.axes.spines.values():
-                spine.set_color("white")
+    def toggle_auto_refresh(self, state):
+        self.auto_refresh_enabled = state == 2  # Qt.Checked
+        if self.auto_refresh_enabled:
+            self.refresh_timer.start(self.refresh_interval)
+            self.log.info(f"Auto-refresh enabled ({self.refresh_interval/1000:.0f}s interval)")
+        else:
+            self.refresh_timer.stop()
+            self.log.info("Auto-refresh disabled")
 
-            im = self.axes.imshow(image_array, cmap="magma", aspect="equal")
-            self.colorbar = self.figure.colorbar(im, ax=self.axes, shrink=0.8)
-            self.colorbar.ax.tick_params(colors="white", labelsize=10)
-
-            self.axes.set_xlabel("X (pixels)", color="white", fontsize=12, fontweight="bold")
-            self.axes.set_ylabel("Y (pixels)", color="white", fontsize=12, fontweight="bold")
-            self.axes.tick_params(colors="white", labelsize=10)
-
-            stats = f"min: {image_array.min():.0f}  max: {image_array.max():.0f}  mean: {image_array.mean():.1f}"
-            full_title = f"{title}\n{stats}" if title else stats
-            self.axes.set_title(full_title, color="white", fontsize=11, fontweight="bold")
-
-            self.figure.subplots_adjust(left=0.1, right=0.94, top=0.9, bottom=0.12)
-            self.canvas.draw()
-        except Exception as e:
-            self.log.error(f"Failed to display image: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to display image:\n{e}")
-
-    def _choose_type_and_save(self, array, extra_meta=None):
-        """Ask dark/flat, then save into that subfolder. Returns the
-        saved path, or None if cancelled/failed (already logged/shown)."""
-        image_type, ok = QInputDialog.getItem(
-            self, "Image Type", "Save as:", IMAGE_TYPES, 0, False)
-        if not ok:
-            self.log.info("Save cancelled at type selection")
-            return None
-
-        save_type = self.save_type_dropdown.currentText()
-        try:
-            path = self.cam.save_image(array, self.data_root, save_type=save_type,
-                                        extra_meta=extra_meta, subfolder=image_type)
-        except OSError as e:
-            self.log.error(f"Failed to save: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
-            return None
-        self.log.info(f"Saved to {path}")
-        QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
-        return path
-
-    def _prompt_save_then_type(self, array, extra_meta=None):
-        """Ask 'save this?' first, then (if yes) dark/flat. Used right
-        after a capture completes; the manual Save button skips straight
-        to _choose_type_and_save since clicking it already means yes."""
-        reply = QMessageBox.question(self, "Save Image", "Save this capture?",
-                                      QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            self.log.info("Save skipped by user")
-            return None
-        return self._choose_type_and_save(array, extra_meta=extra_meta)
-
-    def save_current_image(self):
-        """Saves whatever's currently displayed (a single frame, or a
-        burst's median frame) -- not the full burst cube. The full cube
-        is offered via the auto-prompt shown right after 'Take Burst'."""
-        if self.current_image_array is None:
-            QMessageBox.warning(self, "No Image", "No image is currently displayed to save.")
-            self.log.warning("Attempted to save image but no image is currently displayed")
-            return
-        self._choose_type_and_save(self.current_image_array, extra_meta=self.current_capture_meta)
+    def update_refresh_interval(self, seconds):
+        self.refresh_interval = seconds * 1000
+        if self.auto_refresh_enabled:
+            self.refresh_timer.stop()
+            self.refresh_timer.start(self.refresh_interval)
+            self.log.info(f"Auto-refresh interval updated to {seconds}s")
 
 
-class CredControlMainWindow(QMainWindow):
+class CredMonitorMainWindow(QMainWindow):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.log = setup_logger()
-        self.setWindowTitle(config.get("gui", {}).get("window_title", "C-RED ONE Control"))
+        self.setWindowTitle(config.get("gui", {}).get("window_title", "C-RED ONE Monitor"))
 
         geom = config.get("gui", {}).get("window_geometry", [100, 100, 1200, 800])
         self.setGeometry(*geom)
@@ -525,10 +413,13 @@ class CredControlMainWindow(QMainWindow):
                 self.log.warning(f"Could not apply Keck theme: {e}")
 
         self.statusBar().showMessage("Ready")
-        self.widget = CredControlWidget(config)
+        self.widget = CredMonitorWidget(config)
         self.setCentralWidget(self.widget)
 
     def apply_keck_theme(self):
+        """Same theme-loading pattern as the DM reception test GUI --
+        falls back to a simplified compatibility stylesheet if the shared
+        .qss file isn't found."""
         try:
             stylesheet_path = os.path.join(os.path.dirname(__file__), "..", "keck_theme", "keck_dark_purple.qss")
             if os.path.exists(stylesheet_path):
@@ -554,17 +445,13 @@ class CredControlMainWindow(QMainWindow):
             QPushButton:hover { background-color: #357ABD; }
             QPushButton:pressed { background-color: #2A5A8B; }
             QLabel { color: white; background: transparent; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-                background-color: #404040; color: white; border: 1px solid #483D8B;
-                border-radius: 3px; padding: 4px;
-            }
         """)
 
 
 def load_config(config_file=None):
     try:
         if config_file is None:
-            config_path = (Path(__file__).parent / "cred_control_gui_config.yaml").resolve()
+            config_path = (Path(__file__).parent / "cred_monitor_gui_config.yaml").resolve()
         else:
             config_path = Path(config_file).resolve()
         if not config_path.exists():
@@ -579,20 +466,17 @@ def load_config(config_file=None):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setApplicationName("CRED Control")
-    app.setApplicationDisplayName("C-RED ONE Control GUI")
+    app.setApplicationName("CRED Monitor")
+    app.setApplicationDisplayName("C-RED ONE Monitor GUI")
 
     config = load_config()
     cam_cfg = config.get("cam", {})
-    # Promote to a top-level key before config["cam"] gets overwritten
-    # with the live controller instance below.
-    config["data_root"] = cam_cfg.get("data_root", "/usr/local/aodev/CRED-One/Data")
     config["cam"] = CredOneController(
         edt_dir=cam_cfg.get("edt_dir", "/opt/EDTpdv"),
         tmp_frame_path=cam_cfg.get("tmp_frame_path",
                                     "/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw"),
     )
 
-    window = CredControlMainWindow(config)
+    window = CredMonitorMainWindow(config)
     window.show()
     sys.exit(app.exec_())

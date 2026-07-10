@@ -36,7 +36,7 @@ except ImportError as e:
     print(f"Warning: Could not import required modules: {e}")
     print("Some functionality may be limited.")
 
-READOUT_MODES = ["globalresetsingle", "globalresetbursts"]
+READOUT_MODES = ["globalresetsingle", "globalresetcds", "globalresetbursts"]
 IMAGE_TYPES = ["dark", "flat"]
 
 
@@ -76,6 +76,11 @@ class CredControlWidget(QWidget):
 
         self.setupUI()
         self.display_placeholder_image()
+        try:
+            self.get_fps()
+            self.get_gain()
+        except Exception as e:
+            self.log.warning(f"Could not populate initial FPS/gain readback: {e}")
 
     # ------------------------------------------------------------------
     def setupUI(self):
@@ -99,32 +104,34 @@ class CredControlWidget(QWidget):
 
         # FPS
         fps_box = QGroupBox(f"Frame Rate ({self.fps_range[0]}-{self.fps_range[1]} Hz)")
-        fps_layout = QHBoxLayout(fps_box)
+        fps_layout = QGridLayout(fps_box)
         self.fps_input = QDoubleSpinBox()
         self.fps_input.setRange(*self.fps_range)
         self.fps_input.setValue(self.fps_default)
-        fps_get_btn = QPushButton("Get")
-        fps_get_btn.clicked.connect(self.get_fps)
         fps_set_btn = QPushButton("Set")
         fps_set_btn.clicked.connect(self.set_fps)
-        fps_layout.addWidget(self.fps_input)
-        fps_layout.addWidget(fps_get_btn)
-        fps_layout.addWidget(fps_set_btn)
+        self.fps_current_label = QLabel("--")
+        self.fps_current_label.setStyleSheet("font-weight: bold;")
+        fps_layout.addWidget(self.fps_input, 0, 0)
+        fps_layout.addWidget(fps_set_btn, 0, 1)
+        fps_layout.addWidget(QLabel("Current:"), 1, 0)
+        fps_layout.addWidget(self.fps_current_label, 1, 1)
         control_layout.addWidget(fps_box)
 
         # Gain
         gain_box = QGroupBox(f"Gain ({self.gain_range[0]}-{self.gain_range[1]})")
-        gain_layout = QHBoxLayout(gain_box)
+        gain_layout = QGridLayout(gain_box)
         self.gain_input = QDoubleSpinBox()
         self.gain_input.setRange(*self.gain_range)
         self.gain_input.setValue(self.gain_default)
-        gain_get_btn = QPushButton("Get")
-        gain_get_btn.clicked.connect(self.get_gain)
         gain_set_btn = QPushButton("Set")
         gain_set_btn.clicked.connect(self.set_gain)
-        gain_layout.addWidget(self.gain_input)
-        gain_layout.addWidget(gain_get_btn)
-        gain_layout.addWidget(gain_set_btn)
+        self.gain_current_label = QLabel("--")
+        self.gain_current_label.setStyleSheet("font-weight: bold;")
+        gain_layout.addWidget(self.gain_input, 0, 0)
+        gain_layout.addWidget(gain_set_btn, 0, 1)
+        gain_layout.addWidget(QLabel("Current:"), 1, 0)
+        gain_layout.addWidget(self.gain_current_label, 1, 1)
         control_layout.addWidget(gain_box)
 
         # Readout mode
@@ -245,19 +252,21 @@ class CredControlWidget(QWidget):
     # Settings actions
     # ------------------------------------------------------------------
     def get_fps(self):
+        """Refreshes the read-only 'Current' label -- does not touch the
+        setpoint input, which is the user's next value to Set."""
         try:
             value, raw = self.cam.get_fps()
-            if value is not None:
-                self.fps_input.setValue(value)
+            self.fps_current_label.setText(f"{value:g}" if value is not None else raw)
             self.log.info(f"FPS: {raw}")
         except CredOneError as e:
+            self.fps_current_label.setText("Error")
             self.log.error(f"Failed to get FPS: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to get FPS:\n{e}")
 
     def set_fps(self):
         try:
             raw = self.cam.set_fps(self.fps_input.value())
             self.log.info(f"Set FPS to {self.fps_input.value()}: {raw}")
+            self.get_fps()  # refresh the readback with what the camera actually has now
         except CredOneError as e:
             self.log.error(f"Failed to set FPS: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set FPS:\n{e}")
@@ -265,17 +274,17 @@ class CredControlWidget(QWidget):
     def get_gain(self):
         try:
             value, raw = self.cam.get_gain()
-            if value is not None:
-                self.gain_input.setValue(value)
+            self.gain_current_label.setText(f"{value:g}" if value is not None else raw)
             self.log.info(f"Gain: {raw}")
         except CredOneError as e:
+            self.gain_current_label.setText("Error")
             self.log.error(f"Failed to get gain: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to get gain:\n{e}")
 
     def set_gain(self):
         try:
             raw = self.cam.set_gain(self.gain_input.value())
             self.log.info(f"Set gain to {self.gain_input.value()}: {raw}")
+            self.get_gain()  # refresh the readback with what the camera actually has now
         except CredOneError as e:
             self.log.error(f"Failed to set gain: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set gain:\n{e}")

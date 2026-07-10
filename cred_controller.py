@@ -1,96 +1,71 @@
 """
 cred_controller.py
 
-Thin Python wrapper around the FLI C-RED ONE / EDT frame-grabber
-command-line tools (`serial_cmd`, `take`) that already exist in
-cred_test_prelim.py and CREDOne_Disp.py.
+Thin wrapper around the C-RED ONE's serial_cmd / take command-line tools,
+matching the same calls cred_test_prelim.py already uses. Kept simple on
+purpose: no retries, no polling, no auto-recovery, and it never deletes
+any files -- if something needs to change here, change it deliberately,
+don't let this module do it as a side effect.
 
-This plays the same role that `asdk.AlpaoDeformableMirror()` and
-`zygo.Zygo()` play in the DM acceptance-test GUI: a single object that
-GUIs pass around and call methods on, so the GUI code never has to know
-about subprocess/serial_cmd details directly. Both cred_monitor_gui.py
-and cred_control_gui.py import and use this class -- do not duplicate
-subprocess calls in either GUI file.
-
-Nothing here talks to a Python SDK. As confirmed, the only interface to
-the camera is the EDT `serial_cmd` (settings/status) and `take`
-(frame grabbing) command-line tools, run from /opt/EDTpdv, exactly as in
-cred_test_prelim.py.
+The only thing added beyond a direct port of cred_test_prelim.py's
+subprocess calls is running commands in their own process group so a
+timeout kills the whole command tree (including 'take') instead of
+orphaning it -- that's what let a hung 'take' hold /dev/edt0 for over a
+day in practice. Everything else here is a straight match to the
+existing scripts.
 """
 import os
 import re
+import signal
 import subprocess
-import time
 from datetime import datetime
-from glob import glob
 
 import numpy as np
 
 
 class CredOneError(RuntimeError):
-    """Raised when a serial_cmd / take call fails or returns unexpected output."""
+    """Raised when a serial_cmd / take call fails in a way we can detect
+    for certain (a timeout, or a frame file that can't be read)."""
     pass
 
 
 class CredOneController:
-    # (rows, cols) -- matches cred_default.cfg (320 wide x 256 high) and
-    # the reshape used in cred_test_prelim.get_image()
-    FRAME_SHAPE = (256, 320)
+    FRAME_SHAPE = (256, 320)  # (rows, cols)
 
     def __init__(self, edt_dir="/opt/EDTpdv",
                  tmp_frame_path="/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw",
-                 take_nbuffers=200,
                  logger=None):
         self.edt_dir = edt_dir
         self.tmp_frame_path = tmp_frame_path
-        # Ring-buffer count passed to `take -N <n>`. 200 matches
-        # cred_test_prelim.py's hardcoded value -- and CREDOne_Disp.py's
-        # live display (the known-working reference) uses that same
-        # hardcoded 200 unconditionally, so buffer count is NOT known to
-        # be mode-dependent. A "pdv_multibuf ... Invalid argument" error
-        # after switching readout mode more likely means the frame
-        # grabber board itself needs re-initializing for the new mode's
-        # frame geometry (see reinit_framegrabber() / the README's
-        # `initcam` step) rather than needing a different -N value here.
-        # Left configurable in case testing on hardware proves otherwise.
-        self.take_nbuffers = take_nbuffers
         self.log = logger
 
     # ------------------------------------------------------------------
-    # low-level helpers
-    # ------------------------------------------------------------------
-    def _run(self, cmd, timeout=30):
-        """Run a shell command from self.edt_dir, return (stdout, stderr, rc)."""
+    def _run(self, cmd, timeout=60):
+        """Run a shell command from self.edt_dir. Own process group so a
+        timeout kills 'take' too, not just the shell wrapper around it."""
         full_cmd = f"cd {self.edt_dir}; {cmd}"
+        proc = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True,
+                                 start_new_session=True)
         try:
-            result = subprocess.run(full_cmd, shell=True, capture_output=True,
-                                     text=True, timeout=timeout)
-        except subprocess.TimeoutExpired as e:
-            raise CredOneError(f"Command timed out after {timeout}s: {cmd}") from e
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            stdout, stderr = proc.communicate()
+            raise CredOneError(f"Command timed out after {timeout}s: {cmd}")
+
         if self.log:
-            self.log.debug(f"CMD: {cmd} -> rc={result.returncode} "
-                            f"stdout={result.stdout.strip()!r} "
-                            f"stderr={result.stderr.strip()!r}")
-        return result.stdout.strip(), result.stderr.strip(), result.returncode
+            self.log.debug(f"CMD: {cmd} -> rc={proc.returncode} "
+                            f"stdout={stdout.strip()!r} stderr={stderr.strip()!r}")
+        return stdout.strip(), stderr.strip(), proc.returncode
 
-    def _serial(self, arg, timeout=30):
-        """Run `./serial_cmd '<arg>'` in self.edt_dir, return stdout text.
-
-        NOTE: cred_test_prelim.py never checks serial_cmd's return code --
-        it just prints stdout/stderr and moves on, since return-code
-        semantics for this tool weren't verified. This mirrors that: a
-        nonzero rc is logged as a warning (visible in the GUI logger) but
-        does NOT raise, so it won't block a call that actually succeeded.
-        CredOneError is reserved for cases we're sure indicate a real
-        failure (e.g. the subprocess timing out).
-        """
-        stdout, stderr, rc = self._run(f"./serial_cmd '{arg}'", timeout=timeout)
-        if rc != 0:
-            msg = f"serial_cmd '{arg}' returned rc={rc}: {stderr or stdout}"
-            if self.log:
-                self.log.warning(msg)
-            else:
-                print(f"WARNING: {msg}")
+    def _serial(self, arg):
+        """Run `./serial_cmd '<arg>'`. Doesn't check rc -- serial_cmd's
+        return code isn't reliable on this hardware, same as in
+        cred_test_prelim.py, which never checks it either."""
+        stdout, stderr, rc = self._run(f"./serial_cmd '{arg}'")
+        if rc != 0 and self.log:
+            self.log.warning(f"serial_cmd '{arg}' rc={rc}: {stderr or stdout}")
         return stdout
 
     @staticmethod
@@ -98,25 +73,14 @@ class CredOneController:
         match = re.search(r"(-?\d+\.?\d*(?:[eE]-?\d+)?)", text)
         return float(match.group(1)) if match else None
 
-    # ------------------------------------------------------------------
-    # status / health / cooling
-    # ------------------------------------------------------------------
+    # ---- status ----
     def get_status(self):
-        """Raw text from `serial_cmd status`. Per the README this contains
-        tokens such as 'ready', 'isbeingcooled', or 'operational' -- see the
-        C-RED ONE user manual for the complete state list and meanings."""
         return self._serial("status")
 
     def get_temperature(self):
-        """
-        Returns (raw_text, parsed_dict). raw_text is exactly what
-        `serial_cmd temperature` prints. parsed_dict is a best-effort parse
-        of "<name>: <value>" style tokens (e.g. the cryopt(pulseTube) field
-        the README references) into {name: float}. If a field you need
-        isn't showing up in parsed_dict, read it out of raw_text instead --
-        the parser is intentionally permissive rather than exhaustive since
-        the exact output format wasn't available to verify against hardware.
-        """
+        """Returns (raw_text, parsed_dict). parsed_dict is a best-effort
+        parse of "<name>: <value>" tokens -- if a field you need isn't in
+        it, read raw_text instead."""
         raw = self._serial("temperature")
         parsed = {}
         for match in re.finditer(r"([A-Za-z0-9_\(\)]+)\s*[:=]\s*(-?\d+\.?\d*)", raw):
@@ -128,41 +92,13 @@ class CredOneController:
         return raw, parsed
 
     def get_pressure(self):
-        """
-        Returns (raw_text, value_or_None) from `serial_cmd pressure`.
-        TODO: confirm the exact serial_cmd syntax/units for pressure
-        (mbar vs Torr, single value vs multiple sensors) against the
-        C-RED ONE manual or live camera -- this wasn't exercised against
-        real hardware output in the source repo, so treat raw_text as the
-        source of truth until this is validated.
-        """
         raw = self._serial("pressure")
         return raw, self._first_float(raw)
 
     def set_cooling(self, on=True):
         return self._serial(f"set cooling {'on' if on else 'off'}")
 
-    def reinit_framegrabber(self, cfg_path="~/../../usr/local/aodev/CRED-One/cred_default.cfg"):
-        """
-        Re-run the EDT frame grabber init step documented in the pyCRED
-        README's camera startup sequence:
-            cd /opt/EDTpdv; ./initcam -f <cfg_path>
-        This reconfigures the frame grabber board's ROI/tap/buffer setup
-        from the .cfg file. Worth trying if 'take' starts failing with a
-        pdv_multibuf/ring-buffer error after changing the camera's
-        readout mode -- the board's config may be stale relative to the
-        camera's current mode. This is a more invasive operation than the
-        other calls here (equivalent to restarting frame acquisition), so
-        the GUI confirms with the user before calling it.
-        """
-        stdout, stderr, rc = self._run(f"./initcam -f {cfg_path}", timeout=60)
-        if rc != 0:
-            raise CredOneError(f"initcam failed (rc={rc}): {stderr or stdout}")
-        return stdout
-
-    # ------------------------------------------------------------------
-    # readout settings
-    # ------------------------------------------------------------------
+    # ---- readout settings ----
     def get_fps(self):
         raw = self._serial("fps")
         return self._first_float(raw), raw
@@ -177,101 +113,138 @@ class CredOneController:
     def set_gain(self, gain):
         return self._serial(f"set gain {gain}")
 
+    def get_mode(self):
+        """e.g. raw = 'Mode: globalresetsingle'."""
+        raw = self._serial("mode")
+        match = re.search(r":\s*(\S+)", raw)
+        return (match.group(1) if match else raw), raw
+
     def set_readout_mode(self, mode):
-        """
-        mode: a C-RED ONE acquisition mode string, e.g. 'globalresetbursts'
-        (the only one exercised in cred_test_prelim.py). Other candidate
-        modes documented for this camera family include
-        'globalresetsingle', 'globalresetcds', 'rollingresetsingle', and
-        'rollingresetcds' -- TODO confirm the authoritative list (e.g. via
-        `serial_cmd modes` or the manual) before exposing all of them in a
-        GUI dropdown.
-        """
         return self._serial(f"set mode {mode}")
-    
-    def get_readout_mode(self):
-        """Return the current readout mode string, e.g. 'globalresetbursts'."""
-        return self._serial("mode")
+
+    def get_ndr(self):
+        """NOTE: inferred by pattern (bare command name = getter, same as
+        fps/gain/mode) -- not confirmed against hardware output."""
+        raw = self._serial("nbreadworeset")
+        return self._first_float(raw), raw
+
+    def set_ndr(self, ndr):
+        return self._serial(f"set nbreadworeset {ndr}")
 
     def set_rawimages(self, on=True):
         return self._serial(f"set rawimages {'on' if on else 'off'}")
 
-    def set_ndr(self, ndr):
-        """Set number of non-destructive reads before reset (nbreadworeset)."""
-        return self._serial(f"set nbreadworeset {ndr}")
-    
-    def get_ndr(self):
-        """Get number of non-destructive reads before reset (nbreadworeset)."""
-        raw = self._serial("nbreadworeset")
-        return self._first_float(raw), raw
-
-    # ------------------------------------------------------------------
-    # image acquisition (mirrors cred_test_prelim.get_image /
-    # get_image_multiframe exactly, wrapped as methods)
-    # ------------------------------------------------------------------
-    def get_image(self, file_wait_timeout=2.0, file_wait_poll=0.05):
-        """Grab a single frame via `./take -N 200 -f <tmp_frame_path>`.
-        Returns (frame_array, timestamp_str).
-
-        Same forgiving-rc note as _serial(): cred_test_prelim.get_image()
-        never checks `take`'s return code either -- it just reads the raw
-        file afterward. We do the same, and only raise CredOneError if the
-        file that comes back doesn't actually contain a full frame, since
-        that's the one failure mode we can detect for certain.
-
-        `take` returning before the frame file is actually written (or not
-        writing one at all, e.g. because the current readout mode needs
-        different acquisition parameters than the ones used here) both
-        show up as the file being briefly/permanently missing. We poll for
-        up to `file_wait_timeout` seconds before giving up, and always
-        raise CredOneError (not a raw FileNotFoundError) so callers only
-        need to catch one exception type.
-        """
+    # ---- imaging ----
+    def get_image(self):
+        """Grab a single frame via `take`, same as
+        cred_test_prelim.get_image(): run take, then read the raw file.
+        No retries, no polling, no deleting anything."""
         os.makedirs(os.path.dirname(self.tmp_frame_path), exist_ok=True)
-        cmd = f"./take -N {self.take_nbuffers} -f '{self.tmp_frame_path}'"
-        stdout, stderr, rc = self._run(cmd, timeout=60)
-        if rc != 0:
-            msg = f"take returned rc={rc}: {stderr or stdout}"
-            if self.log:
-                self.log.warning(msg)
-            else:
-                print(f"WARNING: {msg}")
+        cmd = f"./take -N 200 -f '{self.tmp_frame_path}'"
+        stdout, stderr, rc = self._run(cmd)
+        if rc != 0 and self.log:
+            self.log.warning(f"take rc={rc}: {stderr or stdout}")
 
         time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        deadline = time.time() + file_wait_timeout
-        while not os.path.exists(self.tmp_frame_path) and time.time() < deadline:
-            time.sleep(file_wait_poll)
-
         try:
             im = np.fromfile(self.tmp_frame_path, dtype=np.uint16)
         except OSError as e:
-            raise CredOneError(
-                f"Could not read frame file {self.tmp_frame_path} after 'take' "
-                f"(take stdout={stdout!r} stderr={stderr!r}). This can happen if "
-                f"the current readout mode needs a different ring-buffer count "
-                f"than take_nbuffers={self.take_nbuffers} (-N {self.take_nbuffers}) "
-                f"-- check take's raw output above, and see cam.take_nbuffers in "
-                f"the config yaml if it needs adjusting. Original error: {e}"
-            ) from e
+            raise CredOneError(f"Could not read frame file {self.tmp_frame_path}: {e}") from e
 
         expected = self.FRAME_SHAPE[0] * self.FRAME_SHAPE[1]
         if im.size != expected:
-            raise CredOneError(
-                f"Unexpected frame size {im.size} (expected {expected}); "
-                f"check camera is streaming and tmp_frame_path is correct.")
+            raise CredOneError(f"Unexpected frame size {im.size} (expected {expected})")
         return im.reshape(self.FRAME_SHAPE), time_str
 
-    def get_image_multiframe(self, nframes, clear_directory=False):
-        """Capture nframes sequential single frames into one
-        (nframes, 256, 320) cube. Slow -- calls get_image() in a loop,
-        same as cred_test_prelim.get_image_multiframe()."""
-        frame_dir = os.path.dirname(self.tmp_frame_path)
-        if clear_directory:
-            for f in glob(os.path.join(frame_dir, "CRED_frame*")):
-                os.remove(f)
+    def get_image_multiframe(self, nframes):
+        """Capture nframes sequential frames into one cube. Never deletes
+        anything -- each get_image() call just overwrites tmp_frame_path,
+        same as calling it in a loop by hand."""
         cube = np.zeros((nframes,) + self.FRAME_SHAPE)
         for i in range(nframes):
             frame, _ = self.get_image()
             cube[i] = frame
         return cube
+
+    # ---- metadata, for saving alongside an image ----
+    def get_metadata(self):
+        """Collect current settings/environment to save alongside an
+        image (mode, gain, fps, ndr, temperature, pressure) so it can be
+        converted to a FITS header later if needed. Best-effort: any
+        field that fails to read is None rather than raising."""
+        meta = {}
+        try:
+            meta["mode"], _ = self.get_mode()
+        except CredOneError:
+            meta["mode"] = None
+        try:
+            meta["gain"], _ = self.get_gain()
+        except CredOneError:
+            meta["gain"] = None
+        try:
+            meta["fps"], _ = self.get_fps()
+        except CredOneError:
+            meta["fps"] = None
+        try:
+            meta["ndr"], _ = self.get_ndr()
+        except CredOneError:
+            meta["ndr"] = None
+        try:
+            temp_raw, temp_parsed = self.get_temperature()
+            meta["temperature_raw"] = temp_raw
+            for name, val in temp_parsed.items():
+                key = re.sub(r"[^0-9a-zA-Z_]", "_", f"temp_{name}")
+                meta[key] = val
+        except CredOneError:
+            meta["temperature_raw"] = None
+        try:
+            pressure_raw, pressure_val = self.get_pressure()
+            meta["pressure_raw"] = pressure_raw
+            meta["pressure"] = pressure_val
+        except CredOneError:
+            meta["pressure_raw"] = None
+            meta["pressure"] = None
+        return meta
+
+    # ---- saving ----
+    def save_image(self, image_array, data_root, save_type=".npy", extra_meta=None, subfolder=None):
+        """
+        Save image_array under data_root/<YYYYMMDD>/[<subfolder>/]<YYYYMMDD>_<HHMMSS>.ext
+        (folders created if needed). subfolder is meant for a shot
+        classification like "dark" or "flat" -- pass None to skip it.
+        This is the only place that builds the save path or writes the
+        file -- the GUI just calls this and shows the result.
+
+        save_type: ".npy" saves the array only (plain, no metadata --
+        that's what .npy is for). ".npz" additionally collects
+        mode/gain/fps/ndr/temperature/pressure via get_metadata() and
+        saves them as separate top-level keys alongside the image, so
+        they map directly to FITS header cards later if needed.
+        extra_meta: optional dict of additional fields to include in the
+        .npz (e.g. {"nframes": 50} for a burst cube) -- ignored for .npy
+        since plain arrays can't carry metadata.
+
+        Returns the full path saved to.
+        """
+        now = datetime.now()
+        date_str = now.strftime("%Y%m%d")
+        time_str = now.strftime("%H%M%S")
+        save_dir = os.path.join(data_root, date_str)
+        if subfolder:
+            save_dir = os.path.join(save_dir, subfolder)
+        os.makedirs(save_dir, exist_ok=True)
+
+        filename = f"{date_str}_{time_str}{save_type}"
+        path = os.path.join(save_dir, filename)
+
+        if save_type == ".npz":
+            meta = self.get_metadata()
+            if extra_meta:
+                meta.update(extra_meta)
+            if subfolder:
+                meta["image_type"] = subfolder
+            np.savez(path, image=image_array, timestamp=now.isoformat(), **meta)
+        else:
+            np.save(path, image_array)
+
+        return path

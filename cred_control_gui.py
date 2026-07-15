@@ -69,7 +69,7 @@ class CredControlWidget(QWidget):
         self.gain_default = gain_cfg.get("default", 1)
 
         ndr_cfg = config.get("ndr", {})
-        self.ndr_range = ndr_cfg.get("range", [1, 200])
+        self.ndr_range = ndr_cfg.get("range", [1, 1000])
         self.ndr_default = ndr_cfg.get("default", 1)
 
         burst_cfg = config.get("burst", {})

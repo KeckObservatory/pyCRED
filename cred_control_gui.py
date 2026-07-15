@@ -14,8 +14,7 @@ from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
                               QGroupBox, QPushButton, QCheckBox, QLabel,
                               QSpinBox, QDoubleSpinBox, QGridLayout,
                               QComboBox, QApplication, QSizePolicy,
-                              QMainWindow, QMessageBox, QLineEdit, QFileDialog,
-                              QProgressBar)
+                              QMainWindow, QMessageBox, QProgressBar, QInputDialog)
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -23,8 +22,6 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 
 # --- local project paths ---------------------------------------------------
-# Adjust to match wherever cred_controller.py / pyCRED live in your
-# environment (mirrors the sys.path.insert block in the DM template).
 script_dir = Path(__file__).parent.absolute()
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
@@ -39,17 +36,17 @@ except ImportError as e:
     print(f"Warning: Could not import required modules: {e}")
     print("Some functionality may be limited.")
 
-# TODO: confirm the full/authoritative list of readout modes against the
-# C-RED ONE manual. globalresetsingle is the camera's actual default mode
-# (confirmed on hardware); globalresetbursts is the only other one
-# exercised in cred_test_prelim.py.
-READOUT_MODES = [
-    "globalresetsingle",
-    "globalresetbursts",
-    "globalresetcds",
-    "rollingresetsingle",
-    "rollingresetcds",
-]
+READOUT_MODES = ["globalresetsingle", "globalresetcds", "globalresetbursts"]
+# Combined type+format choice for the save prompt: display string ->
+# (subfolder, save_type). Folder is still just "dark"/"flat" -- the
+# format is folded into a single choice so it can't be forgotten
+# separately from the type.
+SAVE_OPTIONS = {
+    "dark (.npy)": ("dark", ".npy"),
+    "dark (.npz)": ("dark", ".npz"),
+    "flat (.npy)": ("flat", ".npy"),
+    "flat (.npz)": ("flat", ".npz"),
+}
 
 
 class CredControlWidget(QWidget):
@@ -75,25 +72,12 @@ class CredControlWidget(QWidget):
         burst_cfg = config.get("burst", {})
         self.burst_nframes_default = burst_cfg.get("nframes_default", 50)
 
-        self.cred_cfg_path = config.get("cred_cfg_path",
-                                         "~/../../usr/local/aodev/CRED-One/cred_default.cfg")
-        # Confirmed on hardware: capturing too soon after a mode/fps/gain/
-        # ndr/rawimages change fails (pdv_multibuf "Invalid argument").
-        # cred_test_prelim.py's own dark_bursts()/dark_bursts_gain() wait
-        # 30-70s after such changes before capturing -- default to the
-        # more conservative 70s since mode changes are the trigger here.
-        # NOTE: read from a dedicated top-level config key, not
-        # config["cam"] -- that key gets overwritten with the live
-        # CredOneController instance in __main__ before this runs.
-        self.settle_seconds = config.get("settle_seconds", 70)
-        self.settle_remaining = 0
-        self.settle_timer = QTimer()
-        self.settle_timer.timeout.connect(self._settle_tick)
-        self.live_view_paused_by_settle = False
+        # Where "Save Current Image" writes to: <data_root>/<YYYYMMDD>/
+        self.data_root = config.get("data_root", "/usr/local/aodev/CRED-One/Data")
 
         self.operation_in_progress = False
         self.current_image_array = None
-        self.current_burst_cube = None
+        self.current_capture_meta = {}
         self.live_view_enabled = False
         self.live_view_interval = config.get("live_view", {}).get("interval_ms", 500)
         self.live_view_timer = QTimer()
@@ -101,6 +85,11 @@ class CredControlWidget(QWidget):
 
         self.setupUI()
         self.display_placeholder_image()
+        try:
+            self.get_fps()
+            self.get_gain()
+        except Exception as e:
+            self.log.warning(f"Could not populate initial FPS/gain readback: {e}")
 
     # ------------------------------------------------------------------
     def setupUI(self):
@@ -124,32 +113,34 @@ class CredControlWidget(QWidget):
 
         # FPS
         fps_box = QGroupBox(f"Frame Rate ({self.fps_range[0]}-{self.fps_range[1]} Hz)")
-        fps_layout = QHBoxLayout(fps_box)
+        fps_layout = QGridLayout(fps_box)
         self.fps_input = QDoubleSpinBox()
         self.fps_input.setRange(*self.fps_range)
         self.fps_input.setValue(self.fps_default)
-        fps_get_btn = QPushButton("Get")
-        fps_get_btn.clicked.connect(self.get_fps)
         fps_set_btn = QPushButton("Set")
         fps_set_btn.clicked.connect(self.set_fps)
-        fps_layout.addWidget(self.fps_input)
-        fps_layout.addWidget(fps_get_btn)
-        fps_layout.addWidget(fps_set_btn)
+        self.fps_current_label = QLabel("--")
+        self.fps_current_label.setStyleSheet("font-weight: bold;")
+        fps_layout.addWidget(self.fps_input, 0, 0)
+        fps_layout.addWidget(fps_set_btn, 0, 1)
+        fps_layout.addWidget(QLabel("Current:"), 1, 0)
+        fps_layout.addWidget(self.fps_current_label, 1, 1)
         control_layout.addWidget(fps_box)
 
         # Gain
         gain_box = QGroupBox(f"Gain ({self.gain_range[0]}-{self.gain_range[1]})")
-        gain_layout = QHBoxLayout(gain_box)
+        gain_layout = QGridLayout(gain_box)
         self.gain_input = QDoubleSpinBox()
         self.gain_input.setRange(*self.gain_range)
         self.gain_input.setValue(self.gain_default)
-        gain_get_btn = QPushButton("Get")
-        gain_get_btn.clicked.connect(self.get_gain)
         gain_set_btn = QPushButton("Set")
         gain_set_btn.clicked.connect(self.set_gain)
-        gain_layout.addWidget(self.gain_input)
-        gain_layout.addWidget(gain_get_btn)
-        gain_layout.addWidget(gain_set_btn)
+        self.gain_current_label = QLabel("--")
+        self.gain_current_label.setStyleSheet("font-weight: bold;")
+        gain_layout.addWidget(self.gain_input, 0, 0)
+        gain_layout.addWidget(gain_set_btn, 0, 1)
+        gain_layout.addWidget(QLabel("Current:"), 1, 0)
+        gain_layout.addWidget(self.gain_current_label, 1, 1)
         control_layout.addWidget(gain_box)
 
         # Readout mode
@@ -163,20 +154,8 @@ class CredControlWidget(QWidget):
         mode_layout.addWidget(mode_set_btn)
         control_layout.addWidget(mode_box)
 
-        # Frame grabber re-init (the README's `initcam` startup step).
-        # Worth trying if `take` starts failing with a pdv_multibuf /
-        # ring-buffer error after changing readout mode -- the board's
-        # ROI/tap config can end up stale relative to the camera's
-        # current mode.
-        reinit_box = QGroupBox("Frame Grabber")
-        reinit_layout = QVBoxLayout(reinit_box)
-        reinit_btn = QPushButton("Re-init Frame Grabber (initcam)")
-        reinit_btn.clicked.connect(self.reinit_framegrabber)
-        reinit_layout.addWidget(reinit_btn)
-        control_layout.addWidget(reinit_box)
-
         # NDR + raw images
-        ndr_box = QGroupBox(f"NDR / Raw Images")
+        ndr_box = QGroupBox("NDR / Raw Images")
         ndr_layout = QGridLayout(ndr_box)
         self.ndr_input = QSpinBox()
         self.ndr_input.setRange(*self.ndr_range)
@@ -202,37 +181,21 @@ class CredControlWidget(QWidget):
         single_btn = QPushButton("Take Single Image")
         single_btn.clicked.connect(self.take_single_image)
         image_layout.addWidget(single_btn)
-        self.single_btn = single_btn
 
         burst_layout = QHBoxLayout()
         self.burst_nframes_input = QSpinBox()
         self.burst_nframes_input.setRange(1, 5000)
         self.burst_nframes_input.setValue(self.burst_nframes_default)
-        self.user_img_type = QComboBox()
-        self.user_img_type.addItems([".npy", ".npz"])
-        self.user_img_type.setCurrentText(".npy")
         burst_btn = QPushButton("Take Burst")
         burst_btn.clicked.connect(self.take_burst)
         burst_layout.addWidget(QLabel("N frames:"))
         burst_layout.addWidget(self.burst_nframes_input)
-        burst_layout.addWidget(self.user_img_type)
         burst_layout.addWidget(burst_btn)
         image_layout.addLayout(burst_layout)
-        self.burst_btn = burst_btn
 
         self.live_view_checkbox = QCheckBox("Live View")
         self.live_view_checkbox.stateChanged.connect(self.toggle_live_view)
         image_layout.addWidget(self.live_view_checkbox)
-
-        # Camera-settle status. cred_test_prelim.py's dark_bursts() /
-        # dark_bursts_gain() both insert a 30-70s wait after changing
-        # mode/fps/gain/ndr/rawimages before capturing -- confirmed
-        # necessary on hardware (capture fails if you don't wait). This
-        # label + the settle countdown below enforce the same wait here
-        # instead of relying on remembering to pause manually.
-        self.settle_status_label = QLabel("Ready")
-        self.settle_status_label.setStyleSheet("font-weight: bold;")
-        image_layout.addWidget(self.settle_status_label)
 
         save_btn = QPushButton("Save Current Image")
         save_btn.setStyleSheet("""
@@ -288,23 +251,24 @@ class CredControlWidget(QWidget):
         main_splitter.setSizes(self.config.get("gui", {}).get("main_splitter_sizes", [650, 150]))
 
     # ------------------------------------------------------------------
-    # Readback / settings actions
+    # Settings actions
     # ------------------------------------------------------------------
     def get_fps(self):
+        """Refreshes the read-only 'Current' label -- does not touch the
+        setpoint input, which is the user's next value to Set."""
         try:
             value, raw = self.cam.get_fps()
-            if value is not None:
-                self.fps_input.setValue(value)
+            self.fps_current_label.setText(f"{value:g}" if value is not None else raw)
             self.log.info(f"FPS: {raw}")
         except CredOneError as e:
+            self.fps_current_label.setText("Error")
             self.log.error(f"Failed to get FPS: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to get FPS:\n{e}")
 
     def set_fps(self):
         try:
             raw = self.cam.set_fps(self.fps_input.value())
             self.log.info(f"Set FPS to {self.fps_input.value()}: {raw}")
-            self.start_settle("set fps")
+            self.get_fps()  # refresh the readback with what the camera actually has now
         except CredOneError as e:
             self.log.error(f"Failed to set FPS: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set FPS:\n{e}")
@@ -312,18 +276,17 @@ class CredControlWidget(QWidget):
     def get_gain(self):
         try:
             value, raw = self.cam.get_gain()
-            if value is not None:
-                self.gain_input.setValue(value)
+            self.gain_current_label.setText(f"{value:g}" if value is not None else raw)
             self.log.info(f"Gain: {raw}")
         except CredOneError as e:
+            self.gain_current_label.setText("Error")
             self.log.error(f"Failed to get gain: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to get gain:\n{e}")
 
     def set_gain(self):
         try:
             raw = self.cam.set_gain(self.gain_input.value())
             self.log.info(f"Set gain to {self.gain_input.value()}: {raw}")
-            self.start_settle("set gain")
+            self.get_gain()  # refresh the readback with what the camera actually has now
         except CredOneError as e:
             self.log.error(f"Failed to set gain: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set gain:\n{e}")
@@ -333,36 +296,14 @@ class CredControlWidget(QWidget):
         try:
             raw = self.cam.set_readout_mode(mode)
             self.log.info(f"Set readout mode to {mode}: {raw}")
-            self.start_settle("mode change")
         except CredOneError as e:
             self.log.error(f"Failed to set readout mode: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set readout mode:\n{e}")
-
-    def reinit_framegrabber(self):
-        reply = QMessageBox.question(
-            self, "Re-init Frame Grabber",
-            "This re-runs the frame grabber's initcam startup step and will "
-            "briefly interrupt acquisition. Only needed if 'take' is failing "
-            "(e.g. a pdv_multibuf / ring-buffer error) after changing readout "
-            "mode.\n\nContinue?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            self.log.info("Frame grabber re-init cancelled by user")
-            return
-        try:
-            raw = self.cam.reinit_framegrabber(self.cred_cfg_path)
-            self.log.info(f"Frame grabber re-initialized: {raw}")
-            self.start_settle("frame grabber re-init")
-        except CredOneError as e:
-            self.log.error(f"Failed to re-init frame grabber: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to re-init frame grabber:\n{e}")
 
     def set_ndr(self):
         try:
             raw = self.cam.set_ndr(self.ndr_input.value())
             self.log.info(f"Set NDR to {self.ndr_input.value()}: {raw}")
-            self.start_settle("set ndr")
         except CredOneError as e:
             self.log.error(f"Failed to set NDR: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set NDR:\n{e}")
@@ -372,53 +313,9 @@ class CredControlWidget(QWidget):
         try:
             raw = self.cam.set_rawimages(on)
             self.log.info(f"Set raw images {'On' if on else 'Off'}: {raw}")
-            self.start_settle("set rawimages")
         except CredOneError as e:
             self.log.error(f"Failed to set raw images: {e}")
             QMessageBox.critical(self, "Error", f"Failed to set raw images:\n{e}")
-
-    # ------------------------------------------------------------------
-    # Camera-settle period. cred_test_prelim.py's dark_bursts() /
-    # dark_bursts_gain() both wait 30-70s after changing mode/fps/gain/
-    # ndr/rawimages before capturing -- confirmed necessary on hardware
-    # (captures otherwise fail with a pdv_multibuf ring-buffer error).
-    # This enforces the same wait here, with visible feedback, instead of
-    # relying on remembering to pause manually between settings and
-    # capture.
-    # ------------------------------------------------------------------
-    def start_settle(self, reason):
-        self.settle_remaining = self.settle_seconds
-        self._update_settle_label()
-        self.single_btn.setEnabled(False)
-        self.burst_btn.setEnabled(False)
-        if self.live_view_enabled:
-            self.live_view_paused_by_settle = True
-            self.live_view_timer.stop()
-            self.log.info("Live view paused during camera settle period")
-        self.log.info(f"Camera settling for {self.settle_seconds}s after {reason} "
-                       f"(see dark_bursts()/dark_bursts_gain() in cred_test_prelim.py)")
-        self.settle_timer.start(1000)
-
-    def _settle_tick(self):
-        self.settle_remaining -= 1
-        self._update_settle_label()
-        if self.settle_remaining <= 0:
-            self.settle_timer.stop()
-            self.single_btn.setEnabled(True)
-            self.burst_btn.setEnabled(True)
-            self.settle_status_label.setText("Ready")
-            if self.live_view_paused_by_settle:
-                self.live_view_paused_by_settle = False
-                self.live_view_timer.start(self.live_view_interval)
-                self.log.info("Resuming live view after settle period")
-
-    def _update_settle_label(self):
-        if self.settle_remaining > 0:
-            self.settle_status_label.setText(f"Settling: {self.settle_remaining}s remaining")
-            self.settle_status_label.setStyleSheet("font-weight: bold; color: #e67e22;")
-        else:
-            self.settle_status_label.setText("Ready")
-            self.settle_status_label.setStyleSheet("font-weight: bold; color: #2ecc71;")
 
     # ------------------------------------------------------------------
     # Imaging actions
@@ -433,15 +330,12 @@ class CredControlWidget(QWidget):
         if self.operation_in_progress:
             QMessageBox.warning(self, "Operation in Progress", "Another operation is already running.")
             return
-        if self.settle_remaining > 0:
-            QMessageBox.warning(self, "Camera Settling",
-                                 f"Camera is still settling after a recent settings change "
-                                 f"({self.settle_remaining}s remaining). Please wait.")
-            return
         try:
             frame, time_str = self.cam.get_image()
             self.display_image(frame, title=f"Single frame ({time_str})")
+            self.current_capture_meta = {"nframes": 1}
             self.log.info(f"Captured single image at {time_str}")
+            self._prompt_save_then_type(frame, extra_meta=self.current_capture_meta)
         except Exception as e:
             self.log.error(f"Failed to capture image: {e}")
             QMessageBox.critical(self, "Error", f"Failed to capture image:\n{e}")
@@ -449,11 +343,6 @@ class CredControlWidget(QWidget):
     def take_burst(self):
         if self.operation_in_progress:
             QMessageBox.warning(self, "Operation in Progress", "Another operation is already running.")
-            return
-        if self.settle_remaining > 0:
-            QMessageBox.warning(self, "Camera Settling",
-                                 f"Camera is still settling after a recent settings change "
-                                 f"({self.settle_remaining}s remaining). Please wait.")
             return
 
         nframes = self.burst_nframes_input.value()
@@ -475,33 +364,14 @@ class CredControlWidget(QWidget):
             self.log.info(f"Starting burst capture of {nframes} frames...")
             QApplication.processEvents()
 
-            cube = self.run_with_gui_updates(self.cam.get_image_multiframe, nframes, clear_directory=True)
+            cube = self.run_with_gui_updates(self.cam.get_image_multiframe, nframes)
 
             median_frame = np.median(cube, axis=0)
             self.display_image(median_frame, title=f"Burst median ({nframes} frames)")
-            self.current_burst_cube = cube
+            self.current_capture_meta = {"nframes": nframes}
             self.log.info(f"Burst capture complete. Cube shape: {cube.shape}")
+            self._prompt_save_then_type(cube, extra_meta=self.current_capture_meta)
 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            user_type = self.user_img_type.currentText()
-            default_filename = f"cred_burst_{timestamp}{user_type}"
-            reply = QMessageBox.question(
-                self, "Save Burst", f"Save the {nframes}-frame cube as {default_filename}?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply == QMessageBox.Yes:
-                if user_type == ".npy":
-                    self.save_current_image(cube, filename=default_filename, type=user_type)
-                else:
-                    hdr_dict = {}
-                    hdr_dict['NFRAMES'] = nframes
-                    hdr_dict['fps'] = self.cam.get_fps()[0]
-                    hdr_dict['gain'] = self.cam.get_gain()[0]
-                    hdr_dict['readout_mode'] = self.cam.get_readout_mode()
-                    hdr_dict['ndr'] = self.cam.get_ndr()[0]
-                    hdr_dict['temperature'] = self.cam.temperature()[0]
-                    self.save_current_image(cube, filename=default_filename, type=user_type, header_info=hdr_dict)
-  
         except Exception as e:
             self.log.error(f"Burst capture failed: {e}")
             QMessageBox.critical(self, "Error", f"Burst capture failed:\n{e}")
@@ -511,8 +381,7 @@ class CredControlWidget(QWidget):
             self.set_buttons_enabled(True)
 
     def run_with_gui_updates(self, func, *args, **kwargs):
-        """Run func in a background thread while keeping the GUI responsive,
-        same pattern as DMReceptionWidget.run_with_gui_updates."""
+        """Run func in a background thread while keeping the GUI responsive."""
         self.function_complete = False
         self.function_error = None
         self.function_result = None
@@ -545,24 +414,19 @@ class CredControlWidget(QWidget):
     def toggle_live_view(self, state):
         self.live_view_enabled = state == 2  # Qt.Checked
         if self.live_view_enabled:
-            if self.settle_remaining > 0:
-                self.live_view_paused_by_settle = True
-                self.log.info(f"Live view enabled but camera is settling "
-                               f"({self.settle_remaining}s remaining) -- will start once ready")
-            else:
-                self.live_view_timer.start(self.live_view_interval)
-                self.log.info("Live view started")
+            self.live_view_timer.start(self.live_view_interval)
+            self.log.info("Live view started")
         else:
             self.live_view_timer.stop()
-            self.live_view_paused_by_settle = False
             self.log.info("Live view stopped")
 
     def live_view_tick(self):
-        if self.operation_in_progress or self.settle_remaining > 0:
+        if self.operation_in_progress:
             return
         try:
             frame, time_str = self.cam.get_image()
             self.display_image(frame, title=f"Live view ({time_str})")
+            self.current_capture_meta = {"nframes": 1}
         except Exception as e:
             self.log.warning(f"Live view frame failed: {e}")
 
@@ -611,45 +475,48 @@ class CredControlWidget(QWidget):
             self.log.error(f"Failed to display image: {e}")
             QMessageBox.critical(self, "Error", f"Failed to display image:\n{e}")
 
-    def save_current_image(self, filename=None, type='.npy', header_info=None):
+    def _choose_type_and_save(self, array, extra_meta=None):
+        """Ask dark/flat + format in one combined prompt, then save into
+        that subfolder. Returns the saved path, or None if
+        cancelled/failed (already logged/shown)."""
+        choice, ok = QInputDialog.getItem(
+            self, "Save Image", "Save as:", list(SAVE_OPTIONS.keys()), 0, False)
+        if not ok:
+            self.log.info("Save cancelled at type selection")
+            return None
+        image_type, save_type = SAVE_OPTIONS[choice]
+
+        try:
+            path = self.cam.save_image(array, self.data_root, save_type=save_type,
+                                        extra_meta=extra_meta, subfolder=image_type)
+        except OSError as e:
+            self.log.error(f"Failed to save: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+            return None
+        self.log.info(f"Saved to {path}")
+        QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
+        return path
+
+    def _prompt_save_then_type(self, array, extra_meta=None):
+        """Ask 'save this?' first, then (if yes) dark/flat. Used right
+        after a capture completes; the manual Save button skips straight
+        to _choose_type_and_save since clicking it already means yes."""
+        reply = QMessageBox.question(self, "Save Image", "Save this capture?",
+                                      QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.log.info("Save skipped by user")
+            return None
+        return self._choose_type_and_save(array, extra_meta=extra_meta)
+
+    def save_current_image(self):
+        """Saves whatever's currently displayed (a single frame, or a
+        burst's median frame) -- not the full burst cube. The full cube
+        is offered via the auto-prompt shown right after 'Take Burst'."""
         if self.current_image_array is None:
             QMessageBox.warning(self, "No Image", "No image is currently displayed to save.")
             self.log.warning("Attempted to save image but no image is currently displayed")
             return
-
-        header_info = {} if header_info is None else dict(header_info)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if filename is None:
-            default_filename = f"cred_image_{timestamp}.npy"
-        else:
-            default_filename = filename
-
-        if type == '.npz':
-            default_filename = default_filename if default_filename.lower().endswith('.npz') else f"{default_filename}.npz"
-            file_filter = "NumPy archive files (*.npz);;All files (*.*)"
-        else:
-            default_filename = default_filename if default_filename.lower().endswith('.npy') else f"{default_filename}.npy"
-            file_filter = "NumPy files (*.npy);;All files (*.*)"
-
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save CRED Image", default_filename, file_filter)
-        if not file_path:
-            self.log.info("Save operation cancelled by user")
-            return
-
-        if type == '.npz':
-            if not file_path.lower().endswith(".npz"):
-                file_path += ".npz"
-            if header_info:
-                np.savez_compressed(file_path, image=self.current_image_array, header_info=np.array([header_info], dtype=object))
-            else:
-                np.savez_compressed(file_path, image=self.current_image_array)
-        else:
-            if not file_path.lower().endswith(".npy"):
-                file_path += ".npy"
-            np.save(file_path, self.current_image_array)
-
-        self.log.info(f"Current image saved as {file_path}")
-        QMessageBox.information(self, "Image Saved", f"Image saved successfully as:\n{file_path}")
+        self._choose_type_and_save(self.current_image_array, extra_meta=self.current_capture_meta)
 
 
 class CredControlMainWindow(QMainWindow):
@@ -729,14 +596,13 @@ if __name__ == "__main__":
 
     config = load_config()
     cam_cfg = config.get("cam", {})
-    config["cred_cfg_path"] = cam_cfg.get("cred_cfg_path",
-                                           "~/../../usr/local/aodev/CRED-One/cred_default.cfg")
-    config["settle_seconds"] = cam_cfg.get("settle_seconds", 70)
+    # Promote to a top-level key before config["cam"] gets overwritten
+    # with the live controller instance below.
+    config["data_root"] = cam_cfg.get("data_root", "/usr/local/aodev/CRED-One/Data")
     config["cam"] = CredOneController(
         edt_dir=cam_cfg.get("edt_dir", "/opt/EDTpdv"),
         tmp_frame_path=cam_cfg.get("tmp_frame_path",
                                     "/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw"),
-        take_nbuffers=cam_cfg.get("take_nbuffers", 200),
     )
 
     window = CredControlMainWindow(config)

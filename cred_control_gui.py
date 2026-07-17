@@ -10,16 +10,35 @@ from datetime import datetime
 
 from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtCore import QTimer
-from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
-                              QGroupBox, QPushButton, QCheckBox, QLabel,
-                              QSpinBox, QDoubleSpinBox, QGridLayout,
-                              QComboBox, QApplication, QSizePolicy,
-                              QMainWindow, QMessageBox, QProgressBar, QInputDialog)
+from PyQt5.QtWidgets import (
+    QWidget,
+    QHBoxLayout,
+    QVBoxLayout,
+    QSplitter,
+    QGroupBox,
+    QPushButton,
+    QCheckBox,
+    QLabel,
+    QSpinBox,
+    QDoubleSpinBox,
+    QGridLayout,
+    QComboBox,
+    QApplication,
+    QSizePolicy,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QInputDialog,
+)
 
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import (
+    FigureCanvasQTAgg as FigureCanvas,
+)
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.backends.backend_qt5agg import (
+    NavigationToolbar2QT as NavigationToolbar,
+)
 
 # --- local project paths ---------------------------------------------------
 script_dir = Path(__file__).parent.absolute()
@@ -36,7 +55,44 @@ except ImportError as e:
     print(f"Warning: Could not import required modules: {e}")
     print("Some functionality may be limited.")
 
-READOUT_MODES = ["globalresetsingle", "globalresetcds", "globalresetbursts"]
+
+# Readout-mode descriptions and full-frame FPS ceilings.
+READOUT_MODE_INFO = {
+    "globalresetsingle": {
+        "display_name": "Global Reset / Single Read",
+        "max_fps": 3500,
+        "description": (
+            "The detector is globally reset and read once per frame. "
+            "This is the fastest full-frame readout mode."
+        ),
+    },
+    "globalresetcds": {
+        "display_name": "Global Reset / CDS",
+        "max_fps": 1750,
+        "description": (
+            "The detector is read immediately after reset and again after "
+            "the integration. The two reads are subtracted to perform "
+            "correlated double sampling (CDS), which reduces reset noise. "
+            "Because each frame requires two reads, the maximum frame rate "
+            "is approximately half that of single-read mode."
+        ),
+    },
+    "globalresetbursts": {
+        "display_name": "Global Reset / NDR Burst",
+        "max_fps": 3500,
+        "description": (
+            "The detector is globally reset once and then read multiple "
+            "times without another reset. This produces a non-destructive "
+            "read, or up-the-ramp, sequence. The frame rate and number of "
+            "reads per reset must be selected together because too many "
+            "reads at a low frame rate can saturate the detector before "
+            "the next reset."
+        ),
+    },
+}
+
+READOUT_MODES = list(READOUT_MODE_INFO.keys())
+
 # Combined type+format choice for the save prompt: display string ->
 # (subfolder, save_type). Folder is still just "dark"/"flat" -- the
 # format is folded into a single choice so it can't be forgotten
@@ -70,26 +126,40 @@ class CredControlWidget(QWidget):
         self.ndr_default = ndr_cfg.get("default", 1)
 
         burst_cfg = config.get("burst", {})
-        self.burst_nframes_default = burst_cfg.get("nframes_default", 50)
+        self.burst_nframes_default = burst_cfg.get(
+            "nframes_default",
+            50,
+        )
 
         # Where "Save Current Image" writes to: <data_root>/<YYYYMMDD>/
-        self.data_root = config.get("data_root", "/usr/local/aodev/CRED-One/Data")
+        self.data_root = config.get(
+            "data_root",
+            "/usr/local/aodev/CRED-One/Data",
+        )
 
         self.operation_in_progress = False
         self.current_image_array = None
         self.current_capture_meta = {}
+
         self.live_view_enabled = False
-        self.live_view_interval = config.get("live_view", {}).get("interval_ms", 500)
+        self.live_view_interval = config.get(
+            "live_view",
+            {},
+        ).get("interval_ms", 500)
+
         self.live_view_timer = QTimer()
         self.live_view_timer.timeout.connect(self.live_view_tick)
 
         self.setupUI()
         self.display_placeholder_image()
+
         try:
             self.get_fps()
             self.get_gain()
         except Exception as e:
-            self.log.warning(f"Could not populate initial FPS/gain readback: {e}")
+            self.log.warning(
+                f"Could not populate initial FPS/gain readback: {e}"
+            )
 
     # ------------------------------------------------------------------
     def setupUI(self):
@@ -103,6 +173,7 @@ class CredControlWidget(QWidget):
         top_widget = QWidget()
         top_layout = QHBoxLayout(top_widget)
         top_layout.setContentsMargins(0, 0, 0, 0)
+
         top_splitter = QSplitter(QtCore.Qt.Horizontal)
         top_layout.addWidget(top_splitter)
 
@@ -112,66 +183,126 @@ class CredControlWidget(QWidget):
         control_layout.setContentsMargins(5, 5, 5, 5)
 
         # FPS
-        fps_box = QGroupBox(f"Frame Rate ({self.fps_range[0]}-{self.fps_range[1]} Hz)")
-        fps_layout = QGridLayout(fps_box)
+        self.fps_box = QGroupBox(
+            f"Frame Rate "
+            f"({self.fps_range[0]}-{self.fps_range[1]} Hz)"
+        )
+        fps_layout = QGridLayout(self.fps_box)
+
         self.fps_input = QDoubleSpinBox()
         self.fps_input.setRange(*self.fps_range)
         self.fps_input.setValue(self.fps_default)
+
         fps_set_btn = QPushButton("Set")
         fps_set_btn.clicked.connect(self.set_fps)
+
         self.fps_current_label = QLabel("--")
-        self.fps_current_label.setStyleSheet("font-weight: bold;")
+        self.fps_current_label.setStyleSheet(
+            "font-weight: bold;"
+        )
+
         fps_layout.addWidget(self.fps_input, 0, 0)
         fps_layout.addWidget(fps_set_btn, 0, 1)
         fps_layout.addWidget(QLabel("Current:"), 1, 0)
         fps_layout.addWidget(self.fps_current_label, 1, 1)
-        control_layout.addWidget(fps_box)
+
+        control_layout.addWidget(self.fps_box)
 
         # Gain
-        gain_box = QGroupBox(f"Gain ({self.gain_range[0]}-{self.gain_range[1]})")
+        gain_box = QGroupBox(
+            f"Gain "
+            f"({self.gain_range[0]}-{self.gain_range[1]})"
+        )
         gain_layout = QGridLayout(gain_box)
+
         self.gain_input = QDoubleSpinBox()
         self.gain_input.setRange(*self.gain_range)
         self.gain_input.setValue(self.gain_default)
+
         gain_set_btn = QPushButton("Set")
         gain_set_btn.clicked.connect(self.set_gain)
+
         self.gain_current_label = QLabel("--")
-        self.gain_current_label.setStyleSheet("font-weight: bold;")
+        self.gain_current_label.setStyleSheet(
+            "font-weight: bold;"
+        )
+
         gain_layout.addWidget(self.gain_input, 0, 0)
         gain_layout.addWidget(gain_set_btn, 0, 1)
         gain_layout.addWidget(QLabel("Current:"), 1, 0)
         gain_layout.addWidget(self.gain_current_label, 1, 1)
+
         control_layout.addWidget(gain_box)
 
         # Readout mode
         mode_box = QGroupBox("Readout Mode")
         mode_layout = QHBoxLayout(mode_box)
+
         self.mode_dropdown = QComboBox()
         self.mode_dropdown.addItems(READOUT_MODES)
+
+        # The camera mode is not queried at startup, so this remains None
+        # until a mode has been successfully applied from this GUI.
+        self.current_readout_mode = None
+
+        # Show user-friendly definitions as tooltips while retaining the
+        # exact command tokens required by the camera controller.
+        for index, mode in enumerate(READOUT_MODES):
+            info = READOUT_MODE_INFO[mode]
+
+            self.mode_dropdown.setItemData(
+                index,
+                (
+                    f"{info['display_name']} — maximum full-frame "
+                    f"rate: {info['max_fps']} FPS"
+                ),
+                QtCore.Qt.ToolTipRole,
+            )
+
         mode_set_btn = QPushButton("Set")
-        mode_set_btn.clicked.connect(self.set_readout_mode)
+        mode_set_btn.clicked.connect(
+            self.set_readout_mode
+        )
+
         mode_layout.addWidget(self.mode_dropdown)
         mode_layout.addWidget(mode_set_btn)
+
         control_layout.addWidget(mode_box)
 
         # NDR + raw images
         ndr_box = QGroupBox("NDR / Raw Images")
         ndr_layout = QGridLayout(ndr_box)
+
         self.ndr_input = QSpinBox()
         self.ndr_input.setRange(*self.ndr_range)
         self.ndr_input.setValue(self.ndr_default)
+
         ndr_set_btn = QPushButton("Set NDR")
         ndr_set_btn.clicked.connect(self.set_ndr)
+
         self.rawimages_dropdown = QComboBox()
         self.rawimages_dropdown.addItems(["Off", "On"])
+
         rawimages_set_btn = QPushButton("Set Raw Images")
-        rawimages_set_btn.clicked.connect(self.set_rawimages)
+        rawimages_set_btn.clicked.connect(
+            self.set_rawimages
+        )
+
         ndr_layout.addWidget(QLabel("NDR:"), 0, 0)
         ndr_layout.addWidget(self.ndr_input, 0, 1)
         ndr_layout.addWidget(ndr_set_btn, 0, 2)
         ndr_layout.addWidget(QLabel("Raw images:"), 1, 0)
-        ndr_layout.addWidget(self.rawimages_dropdown, 1, 1)
-        ndr_layout.addWidget(rawimages_set_btn, 1, 2)
+        ndr_layout.addWidget(
+            self.rawimages_dropdown,
+            1,
+            1,
+        )
+        ndr_layout.addWidget(
+            rawimages_set_btn,
+            1,
+            2,
+        )
+
         control_layout.addWidget(ndr_box)
 
         # Imaging
@@ -179,32 +310,62 @@ class CredControlWidget(QWidget):
         image_layout = QVBoxLayout(image_box)
 
         single_btn = QPushButton("Take Single Image")
-        single_btn.clicked.connect(self.take_single_image)
+        single_btn.clicked.connect(
+            self.take_single_image
+        )
         image_layout.addWidget(single_btn)
 
         burst_layout = QHBoxLayout()
+
         self.burst_nframes_input = QSpinBox()
         self.burst_nframes_input.setRange(1, 5000)
-        self.burst_nframes_input.setValue(self.burst_nframes_default)
+        self.burst_nframes_input.setValue(
+            self.burst_nframes_default
+        )
+
         burst_btn = QPushButton("Take Burst")
         burst_btn.clicked.connect(self.take_burst)
+
         burst_layout.addWidget(QLabel("N frames:"))
-        burst_layout.addWidget(self.burst_nframes_input)
+        burst_layout.addWidget(
+            self.burst_nframes_input
+        )
         burst_layout.addWidget(burst_btn)
+
         image_layout.addLayout(burst_layout)
 
         self.live_view_checkbox = QCheckBox("Live View")
-        self.live_view_checkbox.stateChanged.connect(self.toggle_live_view)
-        image_layout.addWidget(self.live_view_checkbox)
+        self.live_view_checkbox.stateChanged.connect(
+            self.toggle_live_view
+        )
+        image_layout.addWidget(
+            self.live_view_checkbox
+        )
 
         save_btn = QPushButton("Save Current Image")
-        save_btn.setStyleSheet("""
-            QPushButton { background-color: #0ABAB5; color: white; border: 2px solid #7FFFD4;
-                          border-radius: 5px; padding: 8px 16px; font-weight: bold; }
-            QPushButton:hover { background-color: #40E0D0; }
-            QPushButton:pressed { background-color: #008B8B; }
-        """)
-        save_btn.clicked.connect(self.save_current_image)
+        save_btn.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #0ABAB5;
+                color: white;
+                border: 2px solid #7FFFD4;
+                border-radius: 5px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+
+            QPushButton:hover {
+                background-color: #40E0D0;
+            }
+
+            QPushButton:pressed {
+                background-color: #008B8B;
+            }
+            """
+        )
+        save_btn.clicked.connect(
+            self.save_current_image
+        )
         image_layout.addWidget(save_btn)
 
         control_layout.addWidget(image_box)
@@ -214,108 +375,313 @@ class CredControlWidget(QWidget):
         self.progress_bar.setVisible(False)
         control_layout.addWidget(self.progress_bar)
 
-        # ---------------- Right panel: image display ------------------------
+        # ---------------- Right panel: image display ----------------------
         self.display_widget = QWidget()
         self.display_widget.setMinimumWidth(600)
         self.display_widget.setMinimumHeight(500)
-        self.display_widget.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
-        display_layout = QVBoxLayout(self.display_widget)
+        self.display_widget.setStyleSheet(
+            "background-color: #f0f0f0; "
+            "border: 1px solid #ccc;"
+        )
 
-        self.figure = Figure(figsize=(6, 6), dpi=100, facecolor="black")
+        display_layout = QVBoxLayout(
+            self.display_widget
+        )
+
+        self.figure = Figure(
+            figsize=(6, 6),
+            dpi=100,
+            facecolor="black",
+        )
+
         self.canvas = FigureCanvas(self.figure)
         self.axes = self.figure.add_subplot(111)
-        self.toolbar = NavigationToolbar(self.canvas, self.display_widget)
+
+        self.toolbar = NavigationToolbar(
+            self.canvas,
+            self.display_widget,
+        )
+
         display_layout.addWidget(self.toolbar)
         display_layout.addWidget(self.canvas)
 
         top_splitter.addWidget(control_panel)
         top_splitter.addWidget(self.display_widget)
-        top_splitter.setSizes(self.config.get("gui", {}).get("top_splitter_sizes", [350, 850]))
+        top_splitter.setSizes(
+            self.config.get(
+                "gui",
+                {},
+            ).get(
+                "top_splitter_sizes",
+                [350, 850],
+            )
+        )
         top_splitter.setStretchFactor(0, 0)
         top_splitter.setStretchFactor(1, 1)
 
-        # ---------------- Bottom: logger -------------------------------------
-        logger_config = self.config.get("logging", {})
+        # ---------------- Bottom: logger ----------------------------------
+        logger_config = self.config.get(
+            "logging",
+            {},
+        )
+
         self.logger_widget = LoggerWidget(
             name="CRED Control Log",
-            max_lines=logger_config.get("max_lines", 300),
+            max_lines=logger_config.get(
+                "max_lines",
+                300,
+            ),
             min_height=100,
-            font_size=logger_config.get("font_size", 8),
+            font_size=logger_config.get(
+                "font_size",
+                8,
+            ),
         )
 
         main_splitter.addWidget(top_widget)
-        main_splitter.addWidget(self.logger_widget)
+        main_splitter.addWidget(
+            self.logger_widget
+        )
         main_splitter.setStretchFactor(0, 4)
         main_splitter.setStretchFactor(1, 1)
         main_splitter.setCollapsible(1, True)
-        main_splitter.setSizes(self.config.get("gui", {}).get("main_splitter_sizes", [650, 150]))
+        main_splitter.setSizes(
+            self.config.get(
+                "gui",
+                {},
+            ).get(
+                "main_splitter_sizes",
+                [650, 150],
+            )
+        )
 
     # ------------------------------------------------------------------
     # Settings actions
     # ------------------------------------------------------------------
     def get_fps(self):
-        """Refreshes the read-only 'Current' label -- does not touch the
-        setpoint input, which is the user's next value to Set."""
+        """Refresh the read-only current FPS label.
+
+        This does not modify the FPS input, which remains the user's
+        proposed next setpoint.
+        """
         try:
             value, raw = self.cam.get_fps()
-            self.fps_current_label.setText(f"{value:g}" if value is not None else raw)
+
+            if value is not None:
+                self.fps_current_label.setText(
+                    f"{value:g}"
+                )
+            else:
+                self.fps_current_label.setText(raw)
+
             self.log.info(f"FPS: {raw}")
+
         except CredOneError as e:
             self.fps_current_label.setText("Error")
-            self.log.error(f"Failed to get FPS: {e}")
+            self.log.error(
+                f"Failed to get FPS: {e}"
+            )
 
     def set_fps(self):
         try:
-            raw = self.cam.set_fps(self.fps_input.value())
-            self.log.info(f"Set FPS to {self.fps_input.value()}: {raw}")
-            self.get_fps()  # refresh the readback with what the camera actually has now
+            requested_fps = self.fps_input.value()
+            raw = self.cam.set_fps(requested_fps)
+
+            self.log.info(
+                f"Set FPS to {requested_fps}: {raw}"
+            )
+
+            # Refresh with the value the camera actually accepted.
+            self.get_fps()
+
         except CredOneError as e:
-            self.log.error(f"Failed to set FPS: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set FPS:\n{e}")
+            self.log.error(
+                f"Failed to set FPS: {e}"
+            )
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to set FPS:\n{e}",
+            )
 
     def get_gain(self):
         try:
             value, raw = self.cam.get_gain()
-            self.gain_current_label.setText(f"{value:g}" if value is not None else raw)
+
+            if value is not None:
+                self.gain_current_label.setText(
+                    f"{value:g}"
+                )
+            else:
+                self.gain_current_label.setText(raw)
+
             self.log.info(f"Gain: {raw}")
+
         except CredOneError as e:
             self.gain_current_label.setText("Error")
-            self.log.error(f"Failed to get gain: {e}")
+            self.log.error(
+                f"Failed to get gain: {e}"
+            )
 
     def set_gain(self):
         try:
-            raw = self.cam.set_gain(self.gain_input.value())
-            self.log.info(f"Set gain to {self.gain_input.value()}: {raw}")
-            self.get_gain()  # refresh the readback with what the camera actually has now
+            requested_gain = self.gain_input.value()
+            raw = self.cam.set_gain(requested_gain)
+
+            self.log.info(
+                f"Set gain to {requested_gain}: {raw}"
+            )
+
+            # Refresh with the value the camera actually accepted.
+            self.get_gain()
+
         except CredOneError as e:
-            self.log.error(f"Failed to set gain: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set gain:\n{e}")
+            self.log.error(
+                f"Failed to set gain: {e}"
+            )
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to set gain:\n{e}",
+            )
 
     def set_readout_mode(self):
         mode = self.mode_dropdown.currentText()
+        mode_info = READOUT_MODE_INFO[mode]
+
+        display_name = mode_info["display_name"]
+        max_fps = mode_info["max_fps"]
+        description = mode_info["description"]
+
+        confirmation = QMessageBox(self)
+        confirmation.setIcon(QMessageBox.Warning)
+        confirmation.setWindowTitle(
+            "Confirm Readout Mode Change"
+        )
+        confirmation.setText(
+            f"Change the readout mode to {display_name}?"
+        )
+        confirmation.setInformativeText(
+            f"{description}\n\n"
+            f"Maximum full-frame rate in this mode: "
+            f"{max_fps} FPS.\n\n"
+            "Changing the readout mode changes the maximum "
+            "frame rate available to the camera. The GUI "
+            "frame-rate limit will be updated after the "
+            "mode is applied.\n\n"
+            "Do you want to continue?"
+        )
+        confirmation.setStandardButtons(
+            QMessageBox.Yes | QMessageBox.No
+        )
+        confirmation.setDefaultButton(
+            QMessageBox.No
+        )
+
+        response = confirmation.exec_()
+
+        if response != QMessageBox.Yes:
+            self.log.info(
+                f"Readout mode change to {mode} "
+                f"cancelled by user"
+            )
+
+            # If this GUI has previously applied a mode, return the
+            # dropdown to that mode. On the first cancellation, leave
+            # the selection alone because the startup mode is unknown.
+            if self.current_readout_mode is not None:
+                self.mode_dropdown.setCurrentText(
+                    self.current_readout_mode
+                )
+
+            return
+
         try:
             raw = self.cam.set_readout_mode(mode)
-            self.log.info(f"Set readout mode to {mode}: {raw}")
+
+            self.log.info(
+                f"Set readout mode to {mode}: {raw}"
+            )
+
+            self.current_readout_mode = mode
+
+            # Restrict future FPS commands to this mode's full-frame
+            # ceiling. Do not command a new FPS here because the camera
+            # may change it internally when the mode is applied.
+            min_fps = self.fps_range[0]
+
+            self.fps_input.setRange(
+                min_fps,
+                max_fps,
+            )
+
+            self.fps_box.setTitle(
+                f"Frame Rate "
+                f"({min_fps:g}-{max_fps:g} Hz)"
+            )
+
+            # Read back whatever FPS the camera selected after the mode
+            # change.
+            self.get_fps()
+
         except CredOneError as e:
-            self.log.error(f"Failed to set readout mode: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set readout mode:\n{e}")
+            self.log.error(
+                f"Failed to set readout mode: {e}"
+            )
+
+            if self.current_readout_mode is not None:
+                self.mode_dropdown.setCurrentText(
+                    self.current_readout_mode
+                )
+
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to set readout mode:\n{e}",
+            )
 
     def set_ndr(self):
         try:
-            raw = self.cam.set_ndr(self.ndr_input.value())
-            self.log.info(f"Set NDR to {self.ndr_input.value()}: {raw}")
+            requested_ndr = self.ndr_input.value()
+            raw = self.cam.set_ndr(requested_ndr)
+
+            self.log.info(
+                f"Set NDR to {requested_ndr}: {raw}"
+            )
+
         except CredOneError as e:
-            self.log.error(f"Failed to set NDR: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set NDR:\n{e}")
+            self.log.error(
+                f"Failed to set NDR: {e}"
+            )
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to set NDR:\n{e}",
+            )
 
     def set_rawimages(self):
-        on = self.rawimages_dropdown.currentText() == "On"
+        on = (
+            self.rawimages_dropdown.currentText()
+            == "On"
+        )
+
         try:
             raw = self.cam.set_rawimages(on)
-            self.log.info(f"Set raw images {'On' if on else 'Off'}: {raw}")
+
+            self.log.info(
+                f"Set raw images "
+                f"{'On' if on else 'Off'}: {raw}"
+            )
+
         except CredOneError as e:
-            self.log.error(f"Failed to set raw images: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set raw images:\n{e}")
+            self.log.error(
+                f"Failed to set raw images: {e}"
+            )
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to set raw images:\n{e}",
+            )
 
     # ------------------------------------------------------------------
     # Imaging actions
@@ -324,97 +690,198 @@ class CredControlWidget(QWidget):
         for widget in self.findChildren(QPushButton):
             if widget.text() == "Save Current Image":
                 continue
+
             widget.setEnabled(enabled)
 
     def take_single_image(self):
         if self.operation_in_progress:
-            QMessageBox.warning(self, "Operation in Progress", "Another operation is already running.")
+            QMessageBox.warning(
+                self,
+                "Operation in Progress",
+                "Another operation is already running.",
+            )
             return
+
         try:
             frame, time_str = self.cam.get_image()
-            self.display_image(frame, title=f"Single frame ({time_str})")
-            self.current_capture_meta = {"nframes": 1}
-            self.log.info(f"Captured single image at {time_str}")
-            self._prompt_save_then_type(frame, extra_meta=self.current_capture_meta)
+
+            self.display_image(
+                frame,
+                title=f"Single frame ({time_str})",
+            )
+
+            self.current_capture_meta = {
+                "nframes": 1,
+            }
+
+            self.log.info(
+                f"Captured single image at {time_str}"
+            )
+
+            self._prompt_save_then_type(
+                frame,
+                extra_meta=self.current_capture_meta,
+            )
+
         except Exception as e:
-            self.log.error(f"Failed to capture image: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to capture image:\n{e}")
+            self.log.error(
+                f"Failed to capture image: {e}"
+            )
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to capture image:\n{e}",
+            )
 
     def take_burst(self):
         if self.operation_in_progress:
-            QMessageBox.warning(self, "Operation in Progress", "Another operation is already running.")
+            QMessageBox.warning(
+                self,
+                "Operation in Progress",
+                "Another operation is already running.",
+            )
             return
 
         nframes = self.burst_nframes_input.value()
+
         reply = QMessageBox.question(
-            self, "Take Burst",
-            f"Capture {nframes} sequential frames? This may take a while "
-            f"since each frame is grabbed individually.\n\nContinue?",
+            self,
+            "Take Burst",
+            (
+                f"Capture {nframes} sequential frames? "
+                f"This may take a while since each frame "
+                f"is grabbed individually.\n\n"
+                f"Continue?"
+            ),
             QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
         )
+
         if reply != QMessageBox.Yes:
-            self.log.info("Burst capture cancelled by user")
+            self.log.info(
+                "Burst capture cancelled by user"
+            )
             return
 
         try:
             self.operation_in_progress = True
             self.set_buttons_enabled(False)
+
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, 0)
-            self.log.info(f"Starting burst capture of {nframes} frames...")
+
+            self.log.info(
+                f"Starting burst capture of "
+                f"{nframes} frames..."
+            )
+
             QApplication.processEvents()
 
-            cube = self.run_with_gui_updates(self.cam.get_image_multiframe, nframes)
+            cube = self.run_with_gui_updates(
+                self.cam.get_image_multiframe,
+                nframes,
+            )
 
             median_frame = np.median(cube, axis=0)
-            self.display_image(median_frame, title=f"Burst median ({nframes} frames)")
-            self.current_capture_meta = {"nframes": nframes}
-            self.log.info(f"Burst capture complete. Cube shape: {cube.shape}")
-            self._prompt_save_then_type(cube, extra_meta=self.current_capture_meta)
+
+            self.display_image(
+                median_frame,
+                title=(
+                    f"Burst median "
+                    f"({nframes} frames)"
+                ),
+            )
+
+            self.current_capture_meta = {
+                "nframes": nframes,
+            }
+
+            self.log.info(
+                f"Burst capture complete. "
+                f"Cube shape: {cube.shape}"
+            )
+
+            self._prompt_save_then_type(
+                cube,
+                extra_meta=self.current_capture_meta,
+            )
 
         except Exception as e:
-            self.log.error(f"Burst capture failed: {e}")
-            QMessageBox.critical(self, "Error", f"Burst capture failed:\n{e}")
+            self.log.error(
+                f"Burst capture failed: {e}"
+            )
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Burst capture failed:\n{e}",
+            )
+
         finally:
             self.operation_in_progress = False
             self.progress_bar.setVisible(False)
             self.set_buttons_enabled(True)
 
-    def run_with_gui_updates(self, func, *args, **kwargs):
-        """Run func in a background thread while keeping the GUI responsive."""
+    def run_with_gui_updates(
+        self,
+        func,
+        *args,
+        **kwargs,
+    ):
+        """Run a function in a background thread.
+
+        Qt events continue to be processed while the function runs so
+        the GUI remains responsive.
+        """
         self.function_complete = False
         self.function_error = None
         self.function_result = None
+
         last_log_time = time.time()
 
         def run_function():
             try:
-                self.function_result = func(*args, **kwargs)
+                self.function_result = func(
+                    *args,
+                    **kwargs,
+                )
             except Exception as e:
                 self.function_error = e
             finally:
                 self.function_complete = True
 
-        thread = threading.Thread(target=run_function)
+        thread = threading.Thread(
+            target=run_function
+        )
         thread.daemon = True
         thread.start()
 
         while not self.function_complete:
             QApplication.processEvents()
+
             if time.time() - last_log_time > 30:
-                self.log.info("Operation in progress...")
+                self.log.info(
+                    "Operation in progress..."
+                )
                 last_log_time = time.time()
+
             time.sleep(0.1)
 
         thread.join()
+
         if self.function_error:
             raise self.function_error
+
         return self.function_result
 
     def toggle_live_view(self, state):
-        self.live_view_enabled = state == 2  # Qt.Checked
+        self.live_view_enabled = (
+            state == QtCore.Qt.Checked
+        )
+
         if self.live_view_enabled:
-            self.live_view_timer.start(self.live_view_interval)
+            self.live_view_timer.start(
+                self.live_view_interval
+            )
             self.log.info("Live view started")
         else:
             self.live_view_timer.stop()
@@ -423,12 +890,23 @@ class CredControlWidget(QWidget):
     def live_view_tick(self):
         if self.operation_in_progress:
             return
+
         try:
             frame, time_str = self.cam.get_image()
-            self.display_image(frame, title=f"Live view ({time_str})")
-            self.current_capture_meta = {"nframes": 1}
+
+            self.display_image(
+                frame,
+                title=f"Live view ({time_str})",
+            )
+
+            self.current_capture_meta = {
+                "nframes": 1,
+            }
+
         except Exception as e:
-            self.log.warning(f"Live view frame failed: {e}")
+            self.log.warning(
+                f"Live view frame failed: {e}"
+            )
 
     # ------------------------------------------------------------------
     # Display / save
@@ -437,174 +915,426 @@ class CredControlWidget(QWidget):
         self.axes.clear()
         self.axes.set_facecolor("black")
         self.figure.patch.set_facecolor("black")
-        self.axes.text(0.5, 0.5, "C-RED ONE Display", ha="center", va="center",
-                        transform=self.axes.transAxes, fontsize=14, color="white",
-                        fontweight="bold")
+
+        self.axes.text(
+            0.5,
+            0.5,
+            "C-RED ONE Display",
+            ha="center",
+            va="center",
+            transform=self.axes.transAxes,
+            fontsize=14,
+            color="white",
+            fontweight="bold",
+        )
+
         self.axes.set_xlim(0, 1)
         self.axes.set_ylim(0, 1)
         self.axes.set_xticks([])
         self.axes.set_yticks([])
+
         self.canvas.draw()
 
-    def display_image(self, image_array, title=""):
+    def display_image(
+        self,
+        image_array,
+        title="",
+    ):
         try:
-            self.current_image_array = image_array.copy()
+            self.current_image_array = (
+                image_array.copy()
+            )
 
             self.figure.clear()
             self.axes = self.figure.add_subplot(111)
+
             self.figure.patch.set_facecolor("black")
             self.axes.set_facecolor("black")
+
             for spine in self.axes.spines.values():
                 spine.set_color("white")
 
-            im = self.axes.imshow(image_array, cmap="magma", aspect="equal")
-            self.colorbar = self.figure.colorbar(im, ax=self.axes, shrink=0.8)
-            self.colorbar.ax.tick_params(colors="white", labelsize=10)
+            im = self.axes.imshow(
+                image_array,
+                cmap="magma",
+                aspect="equal",
+            )
 
-            self.axes.set_xlabel("X (pixels)", color="white", fontsize=12, fontweight="bold")
-            self.axes.set_ylabel("Y (pixels)", color="white", fontsize=12, fontweight="bold")
-            self.axes.tick_params(colors="white", labelsize=10)
+            self.colorbar = self.figure.colorbar(
+                im,
+                ax=self.axes,
+                shrink=0.8,
+            )
 
-            stats = f"min: {image_array.min():.0f}  max: {image_array.max():.0f}  mean: {image_array.mean():.1f}"
-            full_title = f"{title}\n{stats}" if title else stats
-            self.axes.set_title(full_title, color="white", fontsize=11, fontweight="bold")
+            self.colorbar.ax.tick_params(
+                colors="white",
+                labelsize=10,
+            )
 
-            self.figure.subplots_adjust(left=0.1, right=0.94, top=0.9, bottom=0.12)
+            self.axes.set_xlabel(
+                "X (pixels)",
+                color="white",
+                fontsize=12,
+                fontweight="bold",
+            )
+
+            self.axes.set_ylabel(
+                "Y (pixels)",
+                color="white",
+                fontsize=12,
+                fontweight="bold",
+            )
+
+            self.axes.tick_params(
+                colors="white",
+                labelsize=10,
+            )
+
+            stats = (
+                f"min: {image_array.min():.0f}  "
+                f"max: {image_array.max():.0f}  "
+                f"mean: {image_array.mean():.1f}"
+            )
+
+            if title:
+                full_title = f"{title}\n{stats}"
+            else:
+                full_title = stats
+
+            self.axes.set_title(
+                full_title,
+                color="white",
+                fontsize=11,
+                fontweight="bold",
+            )
+
+            self.figure.subplots_adjust(
+                left=0.1,
+                right=0.94,
+                top=0.9,
+                bottom=0.12,
+            )
+
             self.canvas.draw()
-        except Exception as e:
-            self.log.error(f"Failed to display image: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to display image:\n{e}")
 
-    def _choose_type_and_save(self, array, extra_meta=None):
-        """Ask dark/flat + format in one combined prompt, then save into
-        that subfolder. Returns the saved path, or None if
-        cancelled/failed (already logged/shown)."""
+        except Exception as e:
+            self.log.error(
+                f"Failed to display image: {e}"
+            )
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to display image:\n{e}",
+            )
+
+    def _choose_type_and_save(
+        self,
+        array,
+        extra_meta=None,
+    ):
+        """Ask for dark/flat and file format, then save.
+
+        Returns the saved path, or None if the operation was cancelled
+        or failed.
+        """
         choice, ok = QInputDialog.getItem(
-            self, "Save Image", "Save as:", list(SAVE_OPTIONS.keys()), 0, False)
+            self,
+            "Save Image",
+            "Save as:",
+            list(SAVE_OPTIONS.keys()),
+            0,
+            False,
+        )
+
         if not ok:
-            self.log.info("Save cancelled at type selection")
+            self.log.info(
+                "Save cancelled at type selection"
+            )
             return None
+
         image_type, save_type = SAVE_OPTIONS[choice]
 
         try:
-            path = self.cam.save_image(array, self.data_root, save_type=save_type,
-                                        extra_meta=extra_meta, subfolder=image_type)
+            path = self.cam.save_image(
+                array,
+                self.data_root,
+                save_type=save_type,
+                extra_meta=extra_meta,
+                subfolder=image_type,
+            )
+
         except OSError as e:
-            self.log.error(f"Failed to save: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+            self.log.error(
+                f"Failed to save: {e}"
+            )
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to save:\n{e}",
+            )
             return None
+
         self.log.info(f"Saved to {path}")
-        QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
+
+        QMessageBox.information(
+            self,
+            "Saved",
+            f"Saved to:\n{path}",
+        )
+
         return path
 
-    def _prompt_save_then_type(self, array, extra_meta=None):
-        """Ask 'save this?' first, then (if yes) dark/flat. Used right
-        after a capture completes; the manual Save button skips straight
-        to _choose_type_and_save since clicking it already means yes."""
-        reply = QMessageBox.question(self, "Save Image", "Save this capture?",
-                                      QMessageBox.Yes | QMessageBox.No)
+    def _prompt_save_then_type(
+        self,
+        array,
+        extra_meta=None,
+    ):
+        """Ask whether to save, then request the type and format."""
+        reply = QMessageBox.question(
+            self,
+            "Save Image",
+            "Save this capture?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
         if reply != QMessageBox.Yes:
-            self.log.info("Save skipped by user")
+            self.log.info(
+                "Save skipped by user"
+            )
             return None
-        return self._choose_type_and_save(array, extra_meta=extra_meta)
+
+        return self._choose_type_and_save(
+            array,
+            extra_meta=extra_meta,
+        )
 
     def save_current_image(self):
-        """Saves whatever's currently displayed (a single frame, or a
-        burst's median frame) -- not the full burst cube. The full cube
-        is offered via the auto-prompt shown right after 'Take Burst'."""
+        """Save the image currently displayed in the GUI.
+
+        For a burst, this saves the displayed median frame. The complete
+        burst cube is offered immediately after the burst is captured.
+        """
         if self.current_image_array is None:
-            QMessageBox.warning(self, "No Image", "No image is currently displayed to save.")
-            self.log.warning("Attempted to save image but no image is currently displayed")
+            QMessageBox.warning(
+                self,
+                "No Image",
+                "No image is currently displayed to save.",
+            )
+
+            self.log.warning(
+                "Attempted to save image but no image "
+                "is currently displayed"
+            )
             return
-        self._choose_type_and_save(self.current_image_array, extra_meta=self.current_capture_meta)
+
+        self._choose_type_and_save(
+            self.current_image_array,
+            extra_meta=self.current_capture_meta,
+        )
 
 
 class CredControlMainWindow(QMainWindow):
     def __init__(self, config):
         super().__init__()
+
         self.config = config
         self.log = setup_logger()
-        self.setWindowTitle(config.get("gui", {}).get("window_title", "C-RED ONE Control"))
 
-        geom = config.get("gui", {}).get("window_geometry", [100, 100, 1200, 800])
+        self.setWindowTitle(
+            config.get(
+                "gui",
+                {},
+            ).get(
+                "window_title",
+                "C-RED ONE Control",
+            )
+        )
+
+        geom = config.get(
+            "gui",
+            {},
+        ).get(
+            "window_geometry",
+            [100, 100, 1200, 800],
+        )
+
         self.setGeometry(*geom)
         self.setMinimumSize(1000, 700)
 
-        if self.config.get("styling", {}).get("use_keck_theme", True):
+        if self.config.get(
+            "styling",
+            {},
+        ).get(
+            "use_keck_theme",
+            True,
+        ):
             try:
                 self.apply_keck_theme()
             except Exception as e:
-                self.log.warning(f"Could not apply Keck theme: {e}")
+                self.log.warning(
+                    f"Could not apply Keck theme: {e}"
+                )
 
         self.statusBar().showMessage("Ready")
+
         self.widget = CredControlWidget(config)
         self.setCentralWidget(self.widget)
 
     def apply_keck_theme(self):
         try:
-            stylesheet_path = os.path.join(os.path.dirname(__file__), "..", "keck_theme", "keck_dark_purple.qss")
+            stylesheet_path = os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "keck_theme",
+                "keck_dark_purple.qss",
+            )
+
             if os.path.exists(stylesheet_path):
-                with open(stylesheet_path, "r") as fh:
+                with open(
+                    stylesheet_path,
+                    "r",
+                ) as fh:
                     self.setStyleSheet(fh.read())
-                self.log.info("Full Keck theme applied")
+
+                self.log.info(
+                    "Full Keck theme applied"
+                )
+
             else:
-                self.log.warning("Keck theme file not found, using compatibility theme")
+                self.log.warning(
+                    "Keck theme file not found, "
+                    "using compatibility theme"
+                )
                 self._apply_compatibility_theme()
+
         except Exception as e:
-            self.log.error(f"Error applying Keck theme: {e}, using compatibility theme")
+            self.log.error(
+                f"Error applying Keck theme: {e}, "
+                f"using compatibility theme"
+            )
             self._apply_compatibility_theme()
 
     def _apply_compatibility_theme(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background-color: #2b2b2b; color: white; }
-            QGroupBox { color: white; border: 2px solid #483D8B; border-radius: 5px;
-                        margin-top: 1ex; font-weight: bold; padding-top: 15px; }
-            QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top center;
-                                left: 10px; padding: 0 5px 0 5px; }
-            QPushButton { background-color: #483D8B; color: white; border: 2px solid #357ABD;
-                          border-radius: 5px; padding: 8px 16px; font-weight: bold; }
-            QPushButton:hover { background-color: #357ABD; }
-            QPushButton:pressed { background-color: #2A5A8B; }
-            QLabel { color: white; background: transparent; }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-                background-color: #404040; color: white; border: 1px solid #483D8B;
-                border-radius: 3px; padding: 4px;
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget {
+                background-color: #2b2b2b;
+                color: white;
             }
-        """)
+
+            QGroupBox {
+                color: white;
+                border: 2px solid #483D8B;
+                border-radius: 5px;
+                margin-top: 1ex;
+                font-weight: bold;
+                padding-top: 15px;
+            }
+
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top center;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+
+            QPushButton {
+                background-color: #483D8B;
+                color: white;
+                border: 2px solid #357ABD;
+                border-radius: 5px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+
+            QPushButton:hover {
+                background-color: #357ABD;
+            }
+
+            QPushButton:pressed {
+                background-color: #2A5A8B;
+            }
+
+            QLabel {
+                color: white;
+                background: transparent;
+            }
+
+            QLineEdit,
+            QSpinBox,
+            QDoubleSpinBox,
+            QComboBox {
+                background-color: #404040;
+                color: white;
+                border: 1px solid #483D8B;
+                border-radius: 3px;
+                padding: 4px;
+            }
+            """
+        )
 
 
 def load_config(config_file=None):
     try:
         if config_file is None:
-            config_path = (Path(__file__).parent / "cred_control_gui_config.yaml").resolve()
+            config_path = (
+                Path(__file__).parent
+                / "cred_control_gui_config.yaml"
+            ).resolve()
         else:
-            config_path = Path(config_file).resolve()
+            config_path = Path(
+                config_file
+            ).resolve()
+
         if not config_path.exists():
-            print(f"Configuration file not found at: {config_path}. Using defaults.")
+            print(
+                "Configuration file not found at: "
+                f"{config_path}. Using defaults."
+            )
             return {}
+
         with open(config_path, "r") as f:
             return yaml.safe_load(f) or {}
+
     except yaml.YAMLError as e:
-        print(f"Error parsing YAML configuration: {e}. Using defaults.")
+        print(
+            f"Error parsing YAML configuration: {e}. "
+            f"Using defaults."
+        )
         return {}
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("CRED Control")
-    app.setApplicationDisplayName("C-RED ONE Control GUI")
+    app.setApplicationDisplayName(
+        "C-RED ONE Control GUI"
+    )
 
     config = load_config()
     cam_cfg = config.get("cam", {})
+
     # Promote to a top-level key before config["cam"] gets overwritten
     # with the live controller instance below.
-    config["data_root"] = cam_cfg.get("data_root", "/usr/local/aodev/CRED-One/Data")
+    config["data_root"] = cam_cfg.get(
+        "data_root",
+        "/usr/local/aodev/CRED-One/Data",
+    )
+
     config["cam"] = CredOneController(
-        edt_dir=cam_cfg.get("edt_dir", "/opt/EDTpdv"),
-        tmp_frame_path=cam_cfg.get("tmp_frame_path",
-                                    "/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw"),
+        edt_dir=cam_cfg.get(
+            "edt_dir",
+            "/opt/EDTpdv",
+        ),
+        tmp_frame_path=cam_cfg.get(
+            "tmp_frame_path",
+            "/usr/local/aodev/CRED-One/Data/tmp/"
+            "CRED_frame.raw",
+        ),
     )
 
     window = CredControlMainWindow(config)
     window.show()
+
     sys.exit(app.exec_())

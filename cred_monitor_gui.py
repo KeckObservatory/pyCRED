@@ -414,13 +414,45 @@ class CredMonitorWidget(QWidget):
     # Actions
     # ------------------------------------------------------------------
     def set_cooling(self, on):
-        try:
-            self.cam.set_cooling(on)
-            self.log.info(f"Cooling set {'ON' if on else 'OFF'}")
-            self.refresh_camera_status()
-        except CredOneError as e:
-            self.log.error(f"Failed to set cooling: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to set cooling:\n{e}")
+    if on:
+        title = "Confirm Cooling"
+        message = (
+            "Are you sure you want to turn camera cooling ON?\n\n"
+            "This will begin the camera cooldown process."
+        )
+    else:
+        title = "Confirm Warm Up"
+        message = (
+            "Are you sure you want to turn camera cooling OFF?\n\n"
+            "This will begin the camera warm-up process."
+        )
+
+    response = QMessageBox.question(
+        self,
+        title,
+        message,
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.No,
+    )
+
+    if response != QMessageBox.Yes:
+        self.log.info(
+            f"{'Cooling' if on else 'Warm-up'} command cancelled by user"
+        )
+        return
+
+    try:
+        self.cam.set_cooling(on)
+        self.log.info(f"Cooling set {'ON' if on else 'OFF'}")
+        self.refresh_camera_status()
+
+    except CredOneError as e:
+        self.log.error(f"Failed to set cooling: {e}")
+        QMessageBox.critical(
+            self,
+            "Error",
+            f"Failed to set cooling:\n{e}",
+        )
 
     def toggle_auto_refresh(self, state):
         self.auto_refresh_enabled = state == 2  # Qt.Checked

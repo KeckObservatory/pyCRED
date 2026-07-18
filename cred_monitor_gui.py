@@ -61,7 +61,7 @@ script_dir = Path(__file__).parent.absolute()
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
-from cred_controller import CredOneController, CredOneError
+from cred_controller import CredOneController, CredOneError, CredOneBusyError
 
 
 # Optional GUI modules.
@@ -89,7 +89,11 @@ class CredMonitorWidget(QWidget):
         super().__init__()
 
         self.config = config
-        self.cam = config.get("cam", CredOneController())
+        self.cam = config.get("cam")
+        if self.cam is None:
+            self.cam = CredOneController(
+                skip_serial_while_taking=True,
+            )
         self.log = config.get("logger", setup_logger())
         self.cam.log = self.log
 
@@ -118,6 +122,7 @@ class CredMonitorWidget(QWidget):
 
         # Guard against overlapping polls.
         self._polling = False
+        self._paused_for_take = False
 
         # Full history for the life of this session.
         self.temp_history = {}
@@ -595,15 +600,45 @@ class CredMonitorWidget(QWidget):
         self._polling = True
 
         try:
-            now = datetime.now()
+            # Hold one nonblocking shared lock for the complete monitor
+            # cycle. If ./take owns the exclusive lock, skip the whole
+            # cycle so the GUI stays responsive and no partial history
+            # sample is recorded.
+            with self.cam.monitor_poll():
+                now = datetime.now()
 
-            self.time_history.append(now)
-            self.refresh_temperature(now)
-            self.refresh_pressure(now)
-            self.refresh_camera_status()
+                self.time_history.append(now)
+                self.refresh_temperature(now)
+                self.refresh_pressure(now)
+                self.refresh_camera_status()
 
-            if self.display_widget.isVisible():
-                self._redraw_history_plots()
+                if self.display_widget.isVisible():
+                    self._redraw_history_plots()
+
+            if self._paused_for_take:
+                self.log.info(
+                    "Image acquisition finished; monitor polling resumed"
+                )
+                self._paused_for_take = False
+
+        except CredOneBusyError:
+            if not self._paused_for_take:
+                self.log.info(
+                    "./take is running; monitor polling paused"
+                )
+
+            self._paused_for_take = True
+            self.status_label.setText(
+                "Paused for image acquisition"
+            )
+            self.status_indicator.setStyleSheet(
+                "background-color: #f1c40f; border-radius: 4px;"
+            )
+            self.status_raw_label.setText(
+                "The control GUI is running ./take. Temperature, pressure, "
+                "and status polling will resume automatically when the "
+                "acquisition finishes."
+            )
 
         finally:
             self._polling = False
@@ -1158,17 +1193,30 @@ if __name__ == "__main__":
     config = load_config()
     cam_config = config.get("cam", {})
 
-    config["cam"] = CredOneController(
-        edt_dir=cam_config.get(
-            "edt_dir",
-            "/opt/EDTpdv",
-        ),
-        tmp_frame_path=cam_config.get(
-            "tmp_frame_path",
-            "/usr/local/aodev/CRED-One/Data/"
-            "tmp/CRED_frame.raw",
-        ),
-    )
+    try:
+        config["cam"] = CredOneController(
+            edt_dir=cam_config.get(
+                "edt_dir",
+                "/opt/EDTpdv",
+            ),
+            tmp_frame_path=cam_config.get(
+                "tmp_frame_path",
+                "/usr/local/aodev/CRED-One/Data/"
+                "tmp/CRED_frame.raw",
+            ),
+            lock_path=cam_config.get(
+                "lock_path",
+                "/tmp/pycred_camera_io.lock",
+            ),
+            skip_serial_while_taking=True,
+        )
+    except CredOneError as e:
+        QMessageBox.critical(
+            None,
+            "C-RED ONE Initialization Error",
+            str(e),
+        )
+        sys.exit(1)
 
     window = CredMonitorMainWindow(config)
     window.show()

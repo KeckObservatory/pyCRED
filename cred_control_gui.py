@@ -109,7 +109,9 @@ class CredControlWidget(QWidget):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.cam = config.get("cam", CredOneController())
+        self.cam = config.get("cam")
+        if self.cam is None:
+            self.cam = CredOneController()
         self.log = config.get("logger", setup_logger())
         self.cam.log = self.log
 
@@ -1322,17 +1324,30 @@ if __name__ == "__main__":
         "/usr/local/aodev/CRED-One/Data",
     )
 
-    config["cam"] = CredOneController(
-        edt_dir=cam_cfg.get(
-            "edt_dir",
-            "/opt/EDTpdv",
-        ),
-        tmp_frame_path=cam_cfg.get(
-            "tmp_frame_path",
-            "/usr/local/aodev/CRED-One/Data/tmp/"
-            "CRED_frame.raw",
-        ),
-    )
+    try:
+        config["cam"] = CredOneController(
+            edt_dir=cam_cfg.get(
+                "edt_dir",
+                "/opt/EDTpdv",
+            ),
+            tmp_frame_path=cam_cfg.get(
+                "tmp_frame_path",
+                "/usr/local/aodev/CRED-One/Data/tmp/"
+                "CRED_frame.raw",
+            ),
+            lock_path=cam_cfg.get(
+                "lock_path",
+                "/tmp/pycred_camera_io.lock",
+            ),
+            skip_serial_while_taking=False,
+        )
+    except CredOneError as e:
+        QMessageBox.critical(
+            None,
+            "C-RED ONE Initialization Error",
+            str(e),
+        )
+        sys.exit(1)
 
     window = CredControlMainWindow(config)
     window.show()

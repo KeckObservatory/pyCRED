@@ -1,5 +1,8 @@
 import sys
 import os
+import logging
+import re
+from collections import deque
 
 import yaml
 from pathlib import Path
@@ -84,6 +87,38 @@ STATUS_COLORS = {
 STATUS_DEFAULT_COLOR = "#e74c3c"
 
 
+class SessionLogHandler(logging.Handler):
+    """Keep a complete in-memory log for one monitor-GUI session.
+
+    LoggerWidget may limit the number of lines visible in the GUI, so this
+    handler independently retains every record emitted after the window is
+    opened. A snapshot can then be written to disk at any time.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+        self.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)-8s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+
+    def emit(self, record):
+        try:
+            self.records.append(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+    def snapshot(self):
+        self.acquire()
+        try:
+            return list(self.records)
+        finally:
+            self.release()
+
+
 class CredMonitorWidget(QWidget):
     def __init__(self, config):
         super().__init__()
@@ -94,25 +129,36 @@ class CredMonitorWidget(QWidget):
             self.cam = CredOneController(
                 skip_serial_while_taking=True,
             )
-        self.log = config.get("logger", setup_logger())
+        self.log = config.get("logger")
+        if self.log is None:
+            self.log = setup_logger()
         self.cam.log = self.log
 
         self.auto_refresh_enabled = True
+        monitor_config = config.get("monitor", {})
 
-        self.refresh_interval = config.get(
-            "monitor",
-            {},
-        ).get(
+        self.refresh_interval = monitor_config.get(
             "refresh_interval_ms",
             2000,
         )
 
-        self.max_history_points = config.get(
-            "monitor",
-            {},
-        ).get(
+        self.max_history_points = monitor_config.get(
             "max_history_points",
             600,
+        )
+
+        # Event-detection settings. These defaults require a sustained rise
+        # of at least 1 K across three monitor samples before a warming event
+        # is marked. They can be overridden in cred_monitor_gui_config.yaml.
+        self.temp_rise_alert_k = float(
+            monitor_config.get("temperature_rise_alert_k", 1.0)
+        )
+        self.temp_rise_samples = max(
+            2,
+            int(monitor_config.get("temperature_rise_samples", 3)),
+        )
+        self.temp_rise_alert_cooldown_s = float(
+            monitor_config.get("temperature_rise_alert_cooldown_s", 300)
         )
 
         self.refresh_timer = QTimer()
@@ -128,6 +174,12 @@ class CredMonitorWidget(QWidget):
         self.temp_history = {}
         self.pressure_history = []
         self.time_history = []
+
+        # State used to mark noteworthy events in the saved session log.
+        self._temperature_samples = {}
+        self._last_temperature_alert = {}
+        self._last_cooling_command = None
+        self._last_safe_state = None
 
         self.setupUI()
 
@@ -382,6 +434,30 @@ class CredMonitorWidget(QWidget):
             self.show_plots_checkbox
         )
         control_layout.addWidget(display_box)
+
+        # Session-log controls. Saving writes every log record emitted
+        # since this GUI was opened and exports the complete temperature /
+        # pressure history plot, even when the plot panel is hidden.
+        session_log_box = QGroupBox("Session Log")
+        session_log_layout = QVBoxLayout(session_log_box)
+
+        save_log_btn = QPushButton("Save Session Log + Plots")
+        save_log_btn.clicked.connect(
+            self.request_save_session_log
+        )
+
+        mark_continue_btn = QPushButton(
+            "Mark Continue Pressed"
+        )
+        mark_continue_btn.clicked.connect(
+            self.mark_continue_pressed
+        )
+
+        session_log_layout.addWidget(save_log_btn)
+        session_log_layout.addWidget(
+            mark_continue_btn
+        )
+        control_layout.addWidget(session_log_box)
 
         control_layout.addStretch()
 
@@ -643,11 +719,151 @@ class CredMonitorWidget(QWidget):
         finally:
             self._polling = False
 
+    @staticmethod
+    def _safe_state_from_status(raw):
+        """Return SAFE/PREV SAFE when either state appears in status text."""
+        normalized = re.sub(
+            r"[_-]+",
+            " ",
+            raw.lower(),
+        )
+        normalized = " ".join(normalized.split())
+
+        if (
+            "prev safe" in normalized
+            or "previous safe" in normalized
+            or "prevsafe" in raw.lower()
+        ):
+            return "PREV SAFE"
+
+        if re.search(r"\bsafe\b", normalized):
+            return "SAFE"
+
+        return None
+
+    def _record_status_events(self, raw):
+        safe_state = self._safe_state_from_status(
+            raw
+        )
+
+        if safe_state is not None:
+            if safe_state != self._last_safe_state:
+                self.log.critical(
+                    f"[EVENT SAFE_STATE] Camera status entered "
+                    f"{safe_state}. Raw status: {raw!r}"
+                )
+
+        elif self._last_safe_state is not None:
+            self.log.warning(
+                f"[EVENT SAFE_CLEARED] Camera left "
+                f"{self._last_safe_state}. Continue or another "
+                f"recovery action may have occurred. "
+                f"Raw status: {raw!r}"
+            )
+
+        self._last_safe_state = safe_state
+        return safe_state
+
+    def _record_temperature_event(
+        self,
+        sensor_name,
+        value,
+        now,
+    ):
+        """Mark a sustained cryogenic-temperature rise in the session log."""
+        sensor_key = sensor_name.lower()
+
+        if not any(
+            plotted_name in sensor_key
+            for plotted_name in self.TEMP_PLOT_SENSORS
+        ):
+            return
+
+        samples = self._temperature_samples.setdefault(
+            sensor_name,
+            deque(maxlen=self.temp_rise_samples),
+        )
+        samples.append((now, value))
+
+        if len(samples) < self.temp_rise_samples:
+            return
+
+        values = [
+            sample_value
+            for _, sample_value in samples
+        ]
+
+        steadily_rising = all(
+            later > earlier
+            for earlier, later in zip(
+                values,
+                values[1:],
+            )
+        )
+        total_rise = values[-1] - values[0]
+
+        if (
+            not steadily_rising
+            or total_rise < self.temp_rise_alert_k
+        ):
+            return
+
+        last_alert = self._last_temperature_alert.get(
+            sensor_name
+        )
+        if (
+            last_alert is not None
+            and (now - last_alert).total_seconds()
+            < self.temp_rise_alert_cooldown_s
+        ):
+            return
+
+        if self._last_cooling_command is True:
+            cooling_context = (
+                "the last cooling command sent from this GUI was ON"
+            )
+        elif self._last_cooling_command is False:
+            cooling_context = (
+                "the last cooling command sent from this GUI was OFF"
+            )
+        else:
+            cooling_context = (
+                "no cooling command has been sent from this GUI "
+                "during this session"
+            )
+
+        event_name = (
+            "UNEXPECTED_WARMING"
+            if self._last_cooling_command is not False
+            else "WARMING_AFTER_COOLING_OFF"
+        )
+        log_level = (
+            logging.CRITICAL
+            if self._last_cooling_command is not False
+            else logging.WARNING
+        )
+
+        self.log.log(
+            log_level,
+            f"[EVENT {event_name}] {sensor_name} rose "
+            f"{total_rise:.2f} K, from {values[0]:.2f} K "
+            f"at {samples[0][0].isoformat(timespec='seconds')} "
+            f"to {values[-1]:.2f} K at "
+            f"{samples[-1][0].isoformat(timespec='seconds')}; "
+            f"{cooling_context}.",
+        )
+        self._last_temperature_alert[
+            sensor_name
+        ] = now
+
     def refresh_camera_status(self):
         try:
             raw = self.cam.get_status()
 
             self.status_raw_label.setText(raw)
+            safe_state = self._record_status_events(
+                raw
+            )
 
             token = next(
                 (
@@ -658,15 +874,19 @@ class CredMonitorWidget(QWidget):
                 None,
             )
 
-            color = STATUS_COLORS.get(
-                token,
-                STATUS_DEFAULT_COLOR,
-            )
-
-            if token:
-                label = token
+            if safe_state is not None:
+                color = STATUS_DEFAULT_COLOR
+                label = safe_state
             else:
-                label = "Unknown / check log"
+                color = STATUS_COLORS.get(
+                    token,
+                    STATUS_DEFAULT_COLOR,
+                )
+
+                if token:
+                    label = token
+                else:
+                    label = "Unknown / check log"
 
             self.status_label.setText(
                 label.capitalize()
@@ -715,6 +935,12 @@ class CredMonitorWidget(QWidget):
                     name,
                     [],
                 ).append(value)
+
+                self._record_temperature_event(
+                    name,
+                    value,
+                    now,
+                )
 
             if not parsed:
                 self.log.warning(
@@ -910,9 +1136,170 @@ class CredMonitorWidget(QWidget):
         self.figure.autofmt_xdate()
         self.canvas.draw()
 
+    def save_history_plot(self, path, dpi=150):
+        """Save the complete session temperature/pressure history.
+
+        A separate Figure is built from the stored history, so this works
+        even when the on-screen history panel is hidden.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        plot_background = "#1e1e1e"
+        figure = Figure(
+            figsize=(10, 8),
+            dpi=dpi,
+            facecolor=plot_background,
+        )
+        axes_temp = figure.add_subplot(211)
+        axes_pressure = figure.add_subplot(212, sharex=axes_temp)
+
+        self._style_dark_axes(
+            axes_temp,
+            "Temperature (K)",
+            "C-RED ONE Temperature History",
+        )
+        self._style_dark_axes(
+            axes_pressure,
+            "Pressure",
+            "C-RED ONE Pressure History",
+            xlabel="Time",
+        )
+
+        times = list(self.time_history)
+        plotted_temperature = False
+
+        for name, values in self.temp_history.items():
+            match = next(
+                (
+                    key
+                    for key in self.TEMP_PLOT_SENSORS
+                    if key in name.lower()
+                ),
+                None,
+            )
+            if match is None:
+                continue
+
+            values = list(values)
+            nvalues = min(len(times), len(values))
+            if nvalues == 0:
+                continue
+
+            axes_temp.plot(
+                times[-nvalues:],
+                values[-nvalues:],
+                marker="o",
+                markersize=2,
+                label=name,
+                color=self.TEMP_PLOT_SENSORS[match],
+            )
+            plotted_temperature = True
+
+        if plotted_temperature:
+            legend = axes_temp.legend(
+                loc="upper right",
+                fontsize=8,
+                facecolor=plot_background,
+            )
+            for legend_text in legend.get_texts():
+                legend_text.set_color("white")
+        else:
+            axes_temp.text(
+                0.5,
+                0.5,
+                "No temperature samples recorded",
+                ha="center",
+                va="center",
+                color="white",
+                transform=axes_temp.transAxes,
+            )
+
+        pressure_values = list(self.pressure_history)
+        nvalues = min(len(times), len(pressure_values))
+        plotted_pressure = False
+
+        if nvalues > 0:
+            plot_times = [
+                time_value
+                for time_value, pressure_value in zip(
+                    times[-nvalues:],
+                    pressure_values[-nvalues:],
+                )
+                if pressure_value is not None
+            ]
+            plot_values = [
+                pressure_value
+                for pressure_value in pressure_values[-nvalues:]
+                if pressure_value is not None
+            ]
+
+            if plot_values:
+                axes_pressure.plot(
+                    plot_times,
+                    plot_values,
+                    marker="o",
+                    markersize=2,
+                    color="#f1c40f",
+                )
+                plotted_pressure = True
+
+        if not plotted_pressure:
+            axes_pressure.text(
+                0.5,
+                0.5,
+                "No pressure samples recorded",
+                ha="center",
+                va="center",
+                color="white",
+                transform=axes_pressure.transAxes,
+            )
+
+        time_formatter = mdates.DateFormatter("%H:%M:%S")
+        axes_temp.xaxis.set_major_formatter(time_formatter)
+        axes_pressure.xaxis.set_major_formatter(time_formatter)
+        figure.autofmt_xdate()
+        figure.tight_layout()
+        figure.savefig(
+            path,
+            dpi=dpi,
+            facecolor=figure.get_facecolor(),
+            bbox_inches="tight",
+        )
+        figure.clear()
+        return path
+
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
+    def request_save_session_log(self):
+        main_window = self.window()
+
+        if hasattr(main_window, "save_session_log"):
+            main_window.save_session_log(
+                show_confirmation=True,
+                closing=False,
+            )
+        else:
+            QMessageBox.critical(
+                self,
+                "Session Log Error",
+                "Could not locate the main window's log saver.",
+            )
+
+    def mark_continue_pressed(self):
+        self.log.warning(
+            "[EVENT CONTINUE_PRESSED] Operator marked that "
+            "Continue was pressed."
+        )
+
+        main_window = self.window()
+        if hasattr(main_window, "statusBar"):
+            main_window.statusBar().showMessage(
+                "Continue press marked in session log",
+                5000,
+            )
+
     def set_cooling(self, on):
         if on:
             title = "Confirm Cooling"
@@ -948,10 +1335,12 @@ class CredMonitorWidget(QWidget):
 
         try:
             self.cam.set_cooling(on)
+            self._last_cooling_command = on
 
-            self.log.info(
-                f"Cooling set "
-                f"{'ON' if on else 'OFF'}"
+            self.log.warning(
+                f"[EVENT COOLING_COMMAND] Cooling "
+                f"{'ON' if on else 'OFF'} command sent "
+                f"from the monitor GUI."
             )
 
             self.refresh_camera_status()
@@ -1012,7 +1401,69 @@ class CredMonitorMainWindow(QMainWindow):
         super().__init__()
 
         self.config = config
-        self.log = setup_logger()
+        self.session_started_at = datetime.now()
+
+        self.log = config.get("logger")
+        if self.log is None:
+            self.log = setup_logger()
+
+        # Capture the complete monitor session independently of the
+        # on-screen LoggerWidget, which may retain only a limited number
+        # of visible lines.
+        self.session_log_handler = SessionLogHandler()
+        self.log.addHandler(
+            self.session_log_handler
+        )
+        if self.log.level == logging.NOTSET or self.log.level > logging.DEBUG:
+            self.log.setLevel(logging.DEBUG)
+
+        self.config["logger"] = self.log
+        self.data_root = Path(
+            config.get(
+                "data_root",
+                "/usr/local/aodev/CRED-One/Data",
+            )
+        )
+
+        date_string = self.session_started_at.strftime(
+            "%Y%m%d"
+        )
+        filename = (
+            "cred_monitor_"
+            f"{self.session_started_at:%Y%m%d_%H%M%S}.log"
+        )
+        self.session_log_path = (
+            self.data_root
+            / date_string
+            / "log"
+            / filename
+        )
+
+        session_log_config = config.get("session_log", {})
+        self.save_plot_with_log = bool(
+            session_log_config.get("save_plot_with_log", True)
+        )
+        self.session_plot_dpi = max(
+            72,
+            int(session_log_config.get("plot_dpi", 150)),
+        )
+        self.session_plot_format = str(
+            session_log_config.get("plot_format", "png")
+        ).lower().lstrip(".") or "png"
+        self.session_plot_suffix = str(
+            session_log_config.get("plot_filename_suffix", "_plots")
+        )
+        self.session_plot_path = self.session_log_path.with_name(
+            self.session_log_path.stem
+            + self.session_plot_suffix
+            + "."
+            + self.session_plot_format
+        )
+
+        self.log.info(
+            "[SESSION START] C-RED ONE monitor GUI opened "
+            f"at {self.session_started_at.isoformat(timespec='seconds')}"
+        )
 
         self.setWindowTitle(
             config.get(
@@ -1057,6 +1508,180 @@ class CredMonitorMainWindow(QMainWindow):
 
         self.widget = CredMonitorWidget(config)
         self.setCentralWidget(self.widget)
+
+    def save_session_log(
+        self,
+        show_confirmation=True,
+        closing=False,
+    ):
+        """Write every record captured since this window was opened."""
+        saved_at = datetime.now()
+
+        try:
+            self.session_log_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            self.log.info(
+                "[SESSION LOG SAVE] Writing complete session log "
+                f"to {self.session_log_path}"
+            )
+
+            records = (
+                self.session_log_handler.snapshot()
+            )
+
+            header = [
+                "C-RED ONE MONITOR SESSION LOG",
+                "=" * 72,
+                (
+                    "Session opened: "
+                    f"{self.session_started_at.isoformat(timespec='seconds')}"
+                ),
+                (
+                    "Log saved:      "
+                    f"{saved_at.isoformat(timespec='seconds')}"
+                ),
+                (
+                    "Save reason:    "
+                    f"{'GUI close' if closing else 'manual save'}"
+                ),
+                f"Data root:       {self.data_root}",
+                (
+                    "History plot:    "
+                    + (
+                        str(self.session_plot_path)
+                        if self.save_plot_with_log
+                        else "disabled in configuration"
+                    )
+                ),
+                "",
+                "Important automatic/manual event markers:",
+                "  [EVENT SAFE_STATE]",
+                "  [EVENT SAFE_CLEARED]",
+                "  [EVENT UNEXPECTED_WARMING]",
+                "  [EVENT WARMING_AFTER_COOLING_OFF]",
+                "  [EVENT COOLING_COMMAND]",
+                "  [EVENT CONTINUE_PRESSED]",
+                "",
+                "-" * 72,
+            ]
+
+            payload = "\n".join(
+                header + records
+            ) + "\n"
+
+            with open(
+                self.session_log_path,
+                "w",
+                encoding="utf-8",
+            ) as log_file:
+                log_file.write(payload)
+                log_file.flush()
+                os.fsync(log_file.fileno())
+
+            if self.save_plot_with_log:
+                self.widget.save_history_plot(
+                    self.session_plot_path,
+                    dpi=self.session_plot_dpi,
+                )
+
+        except (OSError, ValueError, RuntimeError) as e:
+            self.log.error(
+                f"Failed to save session log/plot: {e}"
+            )
+            QMessageBox.critical(
+                self,
+                "Session Save Failed",
+                (
+                    "Could not save the monitor session log and plot:\n\n"
+                    f"{e}\n\n"
+                    f"Requested path:\n{self.session_log_path}"
+                ),
+            )
+            return None
+
+        self.statusBar().showMessage(
+            f"Session log and plot saved under {self.session_log_path.parent}",
+            10000,
+        )
+
+        if show_confirmation:
+            QMessageBox.information(
+                self,
+                "Session Log Saved",
+                (
+                    "The complete monitor session was saved to:\n\n"
+                    f"Log:  {self.session_log_path}\n"
+                    + (
+                        f"Plot: {self.session_plot_path}"
+                        if self.save_plot_with_log
+                        else "Plot saving is disabled in the YAML configuration."
+                    )
+                ),
+            )
+
+        return self.session_log_path
+
+    def closeEvent(self, event):
+        timer_was_active = (
+            hasattr(self, "widget")
+            and self.widget.refresh_timer.isActive()
+        )
+
+        if hasattr(self, "widget"):
+            self.widget.refresh_timer.stop()
+
+        reply = QMessageBox.question(
+            self,
+            "Save Monitor Session?",
+            (
+                "Do you want to save the complete monitor log and "
+                "history plots before closing?\n\n"
+                "They will be written under today's data directory "
+                "in the log subfolder."
+            ),
+            (
+                QMessageBox.Yes
+                | QMessageBox.No
+                | QMessageBox.Cancel
+            ),
+            QMessageBox.Yes,
+        )
+
+        if reply == QMessageBox.Cancel:
+            if timer_was_active:
+                self.widget.refresh_timer.start(
+                    self.widget.refresh_interval
+                )
+            event.ignore()
+            return
+
+        if reply == QMessageBox.Yes:
+            self.log.info(
+                "[SESSION END] Monitor GUI close requested "
+                "with log save."
+            )
+
+            saved_path = self.save_session_log(
+                show_confirmation=False,
+                closing=True,
+            )
+            if saved_path is None:
+                if timer_was_active:
+                    self.widget.refresh_timer.start(
+                        self.widget.refresh_interval
+                    )
+                event.ignore()
+                return
+        else:
+            self.log.info(
+                "[SESSION END] Monitor GUI closed without "
+                "saving a final log snapshot."
+            )
+
+        event.accept()
 
     def apply_keck_theme(self):
         """Load the shared Keck theme when available."""
@@ -1192,6 +1817,16 @@ if __name__ == "__main__":
 
     config = load_config()
     cam_config = config.get("cam", {})
+
+    # Match the control GUI's data root. Monitor session logs are saved as:
+    # <data_root>/<YYYYMMDD>/log/cred_monitor_<session start>.log
+    config["data_root"] = cam_config.get(
+        "data_root",
+        config.get(
+            "data_root",
+            "/usr/local/aodev/CRED-One/Data",
+        ),
+    )
 
     try:
         config["cam"] = CredOneController(

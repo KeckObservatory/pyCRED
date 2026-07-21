@@ -1,21 +1,46 @@
+# C-RED ONE monitor GUI configuration
+
+cam:
+  edt_dir: /opt/EDTpdv
+  tmp_frame_path: /usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw
+  data_root: /usr/local/aodev/CRED-One/Data
+  lock_path: /tmp/pycred_camera_io.lock
+
 gui:
-  window_title: "C-RED ONE Monitor"
+  window_title: C-RED ONE Monitor
   window_geometry: [100, 100, 1200, 800]
   top_splitter_sizes: [350, 850]
   main_splitter_sizes: [650, 150]
 
-cam:
-  edt_dir: "/opt/EDTpdv"
-  tmp_frame_path: "/usr/local/aodev/CRED-One/Data/tmp/CRED_frame.raw"
-
 monitor:
   refresh_interval_ms: 2000
+
+  # Kept for backward compatibility. The monitor currently retains the full
+  # temperature/pressure history for the lifetime of the GUI session.
   max_history_points: 600
 
+  # Mark a warming event when a sensor rises by at least this many kelvin
+  # across the configured number of consecutive successful monitor samples.
+  temperature_rise_alert_k: 1.0
+  temperature_rise_samples: 3
+
+  # Prevent the same sensor from producing repeated warming alerts more often
+  # than this number of seconds while it continues to rise.
+  temperature_rise_alert_cooldown_s: 300
+
+session_log:
+  # The Save Session button and close-time save prompt write both the complete
+  # text log and the full temperature/pressure history plot.
+  save_plot_with_log: true
+  plot_format: png
+  plot_dpi: 150
+  plot_filename_suffix: _plots
+
 logging:
+  # This limits only the number of lines visible in the GUI logger. The saved
+  # session log retains every captured record since the GUI was opened.
   max_lines: 300
   font_size: 8
 
 styling:
   use_keck_theme: true
-  font_size: 9

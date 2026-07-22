@@ -1,6 +1,9 @@
 import os
 import sys
 import numpy as np
+# Compatibility patch for old Astropy with NumPy >= 1.23
+if not hasattr(np, "asscalar"):
+    np.asscalar = lambda array: array.item()
 from scipy.ndimage import affine_transform, median_filter
 from skimage.registration import phase_cross_correlation
 from skimage.util import view_as_windows

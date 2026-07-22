@@ -1,9 +1,6 @@
 import os
 import sys
 import numpy as np
-# Compatibility patch for old Astropy with NumPy >= 1.23
-if not hasattr(np, "asscalar"):
-    np.asscalar = lambda array: array.item()
 from scipy.ndimage import affine_transform, median_filter
 from skimage.registration import phase_cross_correlation
 from skimage.util import view_as_windows
@@ -14,7 +11,7 @@ import io
 from configobj import flatten_errors, ConfigObj
 from validate import Validator, ValidateError
 import warnings
-import hcipy
+# import hcipy # dont need it for now
 import matplotlib.pyplot as plt
 import astropy.io.fits as fits
 

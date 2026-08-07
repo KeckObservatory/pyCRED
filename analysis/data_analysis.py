@@ -16,9 +16,9 @@ import warnings
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from analysis.npz_metadata_utils import group_npz_files_by_metadata
+from npz_metadata_utils import group_npz_files_by_metadata
 
-path = os.path.join(Path.home(),"Data/20260715/dark")
+path = '/usr/local/aodev/CRED-One/Data/20260715/dark/'#os.path.join(Path.home(),"Data/20260715/dark")
 
 # Example usage:
 groups_by_fps = group_npz_files_by_metadata(path, "fps")

@@ -16,11 +16,14 @@ import warnings
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from npz_metadata_utils import group_npz_files_by_metadata
+try:
+    from analysis.npz_metadata_utils import group_npz_files_by_metadata
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from npz_metadata_utils import group_npz_files_by_metadata
 
-path = '/usr/local/aodev/CRED-One/Data/20260715/dark/'#os.path.join(Path.home(),"Data/20260715/dark")
+path = '/usr/local/aodev/CRED-One/Data/20260715/dark/'
 
-# Example usage:
+# Example usage: scan the whole folder and group files by metadata.
 groups_by_fps = group_npz_files_by_metadata(path, "fps")
 list_a = groups_by_fps.get(3500.0, [])
 

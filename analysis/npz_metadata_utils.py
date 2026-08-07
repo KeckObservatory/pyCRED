@@ -48,8 +48,15 @@ def list_npz_files(
     pattern: str = "*.npz",
     recursive: bool = False,
 ) -> List[str]:
-    """Return a sorted list of .npz files under a folder."""
+    """Return a sorted list of .npz files from a folder or a single file."""
     root = Path(path)
+
+    if root.is_file() and root.suffix.lower() == ".npz":
+        return [str(root)]
+
+    if not root.exists() or not root.is_dir():
+        return []
+
     if recursive:
         matches = root.rglob(pattern)
     else:
@@ -85,7 +92,11 @@ def group_npz_files_by_metadata(
     groups: Dict[Any, List[str]] = {}
 
     for npz_file in list_npz_files(path, pattern=pattern, recursive=recursive):
-        metadata = read_npz_metadata(npz_file)
+        try:
+            metadata = read_npz_metadata(npz_file)
+        except Exception:
+            continue
+
         value = metadata.get(metadata_key, "<missing>")
         groups.setdefault(value, []).append(os.path.basename(npz_file))
 

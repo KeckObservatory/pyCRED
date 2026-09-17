@@ -1349,7 +1349,7 @@ class CredControlWidget(QWidget):
         for spine in self.axes.spines.values():
             spine.set_color("white")
 
-        im = self.axes.imshow(image_array,cmap="magma",origin="lower",aspect="equal",)
+        im = self.axes.imshow(image_array,cmap="magma",aspect="equal",)
 
         self.colorbar = self.figure.colorbar(im,ax=self.axes,shrink=0.8,)
 
@@ -1435,63 +1435,6 @@ class CredControlWidget(QWidget):
         self.log.info("Pupil mask reset to default values")
         
     def save_pupil(self):
-        """Save the current pupil mask and exit pupil selection mode."""
-        if not self.pupil_selection_active:
-            self.log.info("Save Pupil pressed while not in pupil selection mode")
-            return
-        # Read the current values
-        self.pupil_radius = self.pupil_radius_input.value()
-        self.pupil_separation = self.pupil_separation_input.value()
-        self.mask_center_x = self.mask_center_x_input.value()
-        self.mask_center_y = self.mask_center_y_input.value()
-        
-        # Update the in-memory configuration.
-        self.config["pupil_selection"] = {
-            "radius": float(self.pupil_radius),
-            "separation": float(self.pupil_separation),
-            "center_x": float(self.mask_center_x),
-            "center_y": float(self.mask_center_y),}
-        
-        config_path = (Path(__file__).parent/ "cred_control_gui_config.yaml")
-        try:
-            config_to_save = dict(self.config)
-
-            original_config = load_config(config_path)
-        
-            if "cam" in original_config:
-                config_to_save["cam"] = original_config["cam"]
-                
-            else:
-                config_to_save.pop("cam", None)
-                
-            with open(config_path, "w") as f:
-                yaml.safe_dump(config_to_save,f,sort_keys=False,)
-                
-            self.log.info(
-                "Pupil mask saved: "
-                f"radius={self.pupil_radius}, "
-                f"separation={self.pupil_separation}, "
-                f"center_x={self.mask_center_x}, "
-                f"center_y={self.mask_center_y}")
-        except Exception as e:
-            self.log.error(f"Failed to save pupil configuration: {e}")
-            QMessageBox.critical(self,"Save Error",f"Failed to save pupil configuration:\n{e}",)
-            return
-            
-        # Exit pupil-selection mode
-        self.pupil_selection_active = False
-        # Remove circles from the display
-        self.pupil_circles = []
-        # Return to normal display
-        if self.last_live_frame is not None:
-            self.display_image(self.last_live_frame,title="Last Live Frame",)
-        else:
-            self.display_placeholder_image()
-        self.log.info("Pupil selection complete")
-
-
-
-    def save_pupil(self):
         """Save the current pupil mask and exit pupil selection mode"""
 
         if not self.pupil_selection_active:
@@ -1500,28 +1443,36 @@ class CredControlWidget(QWidget):
                 "pupil selection mode")
             return
 
-        # Read the current values.
-        self.pupil_radius = (self.pupil_radius_input.value())
+        # Read the current values
+        self.pupil_radius = float(self.pupil_radius_input.value())
 
-        self.pupil_separation = (self.pupil_separation_input.value())
+        self.pupil_separation = float(self.pupil_separation_input.value())
 
-        self.mask_center_x = (self.mask_center_x_input.value())
+        self.mask_center_x = float(self.mask_center_x_input.value())
 
-        self.mask_center_y = (self.mask_center_y_input.value())
+        self.mask_center_y = float(self.mask_center_y_input.value())
 
-        # Store them in the configuration dictionary
-        self.config["pupil_selection"] = {
-            "radius": self.pupil_radius,
-            "separation": self.pupil_separation,
-            "center_x": self.mask_center_x,
-            "center_y": self.mask_center_y,}
-
-        # Save configuration to YAML
+        # Path to the YAML configuration file
         config_path = (Path(__file__).parent/ "cred_control_gui_config.yaml")
 
         try:
+            if config_path.exists():
+                with open(config_path, "r") as f:
+                    yaml_config = yaml.safe_load(f) or {}
+            else:
+                yaml_config = {}
+
+            yaml_config["pupil_selection"] = {
+                "radius": self.pupil_radius,
+                "separation": self.pupil_separation,
+                "center_x": self.mask_center_x,
+                "center_y": self.mask_center_y,}
+
             with open(config_path, "w") as f:
-                yaml.safe_dump(self.config,f,sort_keys=False,)
+                yaml.safe_dump(yaml_config,f,sort_keys=False,)
+
+            # Keep the runtime configuration synchronized
+            self.config["pupil_selection"] = (yaml_config["pupil_selection"])
 
             self.log.info(
                 "Pupil mask saved: "
@@ -1531,9 +1482,13 @@ class CredControlWidget(QWidget):
                 f"center_y={self.mask_center_y}")
 
         except Exception as e:
-            self.log.error(f"Failed to save pupil configuration: {e}")
+            self.log.error(
+                f"Failed to save pupil configuration: {e}")
 
-            QMessageBox.critical(self,"Save Error",f"Failed to save pupil configuration:\n{e}",)
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                f"Failed to save pupil configuration:\n{e}",)
             return
 
         # Exit pupil-selection mode
@@ -1543,20 +1498,19 @@ class CredControlWidget(QWidget):
         self.pupil_circles = []
 
         # Return to normal display
-        self.display_image(self.last_live_frame,title="Last Live Frame",)
+        if self.last_live_frame is not None:
+            self.display_image(
+                self.last_live_frame,
+                title="Last Live Frame",
+            )
+        else:
+            self.display_placeholder_image()
 
         self.log.info("Pupil selection complete")
 
 
 
     ###
-
-
-
-
-
-
-
 
 class CredControlMainWindow(QMainWindow):
     def __init__(self, config):

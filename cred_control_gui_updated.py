@@ -1433,6 +1433,62 @@ class CredControlWidget(QWidget):
         self.mask_center_y_input.setValue(self.default_mask_center_y)
 
         self.log.info("Pupil mask reset to default values")
+        
+    def save_pupil(self):
+        """Save the current pupil mask and exit pupil selection mode."""
+        if not self.pupil_selection_active:
+            self.log.info("Save Pupil pressed while not in pupil selection mode")
+            return
+        # Read the current values
+        self.pupil_radius = self.pupil_radius_input.value()
+        self.pupil_separation = self.pupil_separation_input.value()
+        self.mask_center_x = self.mask_center_x_input.value()
+        self.mask_center_y = self.mask_center_y_input.value()
+        
+        # Update the in-memory configuration.
+        self.config["pupil_selection"] = {
+            "radius": float(self.pupil_radius),
+            "separation": float(self.pupil_separation),
+            "center_x": float(self.mask_center_x),
+            "center_y": float(self.mask_center_y),}
+        
+        config_path = (Path(__file__).parent/ "cred_control_gui_config.yaml")
+        try:
+            config_to_save = dict(self.config)
+
+            original_config = load_config(config_path)
+        
+            if "cam" in original_config:
+                config_to_save["cam"] = original_config["cam"]
+                
+            else:
+                config_to_save.pop("cam", None)
+                
+            with open(config_path, "w") as f:
+                yaml.safe_dump(config_to_save,f,sort_keys=False,)
+                
+            self.log.info(
+                "Pupil mask saved: "
+                f"radius={self.pupil_radius}, "
+                f"separation={self.pupil_separation}, "
+                f"center_x={self.mask_center_x}, "
+                f"center_y={self.mask_center_y}")
+        except Exception as e:
+            self.log.error(f"Failed to save pupil configuration: {e}")
+            QMessageBox.critical(self,"Save Error",f"Failed to save pupil configuration:\n{e}",)
+            return
+            
+        # Exit pupil-selection mode
+        self.pupil_selection_active = False
+        # Remove circles from the display
+        self.pupil_circles = []
+        # Return to normal display
+        if self.last_live_frame is not None:
+            self.display_image(self.last_live_frame,title="Last Live Frame",)
+        else:
+            self.display_placeholder_image()
+        self.log.info("Pupil selection complete")
+
 
 
     def save_pupil(self):

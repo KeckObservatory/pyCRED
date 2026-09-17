@@ -1049,21 +1049,16 @@ class CredControlWidget(QWidget):
 
 
     def live_view_tick(self):
-    if self.operation_in_progress:
-        return
-
-    try:
-        frame, time_str = self.cam.get_image()
-
-        # Keep the most recently acquired live-view frame
-        self.last_live_frame = frame.copy()
-
-        self.display_image(frame,title=f"Live view ({time_str})",)
-
-        self.current_capture_meta = {"nframes": 1,}
-
-    except Exception as e:
-        self.log.warning(f"Live view frame failed: {e}")
+        if self.operation_in_progress:
+            return
+        try:
+            frame, time_str = self.cam.get_image() 
+            # Keep the most recently acquired live-view frame
+            self.last_live_frame = frame.copy()
+            self.display_image(frame,title=f"Live view ({time_str})",)
+            self.current_capture_meta = {"nframes": 1,}
+        except Exception as e:
+            self.log.warning(f"Live view frame failed: {e}")
 
     # ------------------------------------------------------------------
     # Display / save

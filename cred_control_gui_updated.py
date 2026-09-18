@@ -1513,7 +1513,7 @@ class CredControlWidget(QWidget):
 
         self.log.info("Pupil selection complete")
 
-def alignment(self):
+    def alignment(self):
         """Calculate and display pupil alignment / tip-tilt information"""
 
         if self.last_live_frame is None:

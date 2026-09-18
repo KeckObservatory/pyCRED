@@ -402,24 +402,29 @@ class CredControlWidget(QWidget):
         control_layout.addWidget(image_box)
 
         ### Pupil Selection
-        pupil_box = QGroupBox("Pupil Selection")
+        pupil_box = QGroupBox("Pupil Selection & Alignment")
         pupil_layout = QGridLayout(pupil_box)
 
         # Buttons
-        self.select_pupil_btn = QPushButton("Select Pupil")
+        self.select_pupil_btn = QPushButton("Select")
         self.select_pupil_btn.clicked.connect(self.select_pupil)
 
         self.auto_pupil_btn = QPushButton("Auto")
         self.auto_pupil_btn.clicked.connect(self.auto_pupil)
 
-        self.save_pupil_btn = QPushButton("Save Pupil")
+        self.save_pupil_btn = QPushButton("Save")
         self.save_pupil_btn.clicked.connect(self.save_pupil)
+
+        self.alignment_btn = QPushButton("Alignment")
+        self.alignment_btn.clicked.connect(self.alignment)
 
         pupil_layout.addWidget(self.select_pupil_btn,0,0,)
 
         pupil_layout.addWidget(self.auto_pupil_btn,0,1,)
 
         pupil_layout.addWidget(self.save_pupil_btn,0,2,)
+
+        pupil_layout.addWidget(self.alignment_btn,0,3,)
 
         # Pupil Radius
         pupil_layout.addWidget(QLabel("Pupil Radius"),1,0,)
@@ -1508,7 +1513,158 @@ class CredControlWidget(QWidget):
 
         self.log.info("Pupil selection complete")
 
+def alignment(self):
+        """Calculate and display pupil alignment / tip-tilt information"""
 
+        if self.last_live_frame is None:
+            QMessageBox.warning(
+                self,
+                "No Image",
+                "No live frame is available for alignment.\n\n"
+                "Start Live View and acquire at least one frame first",)
+            return
+
+        try:
+            full_pupil_arr = np.asarray(self.last_live_frame,dtype=float,)
+
+            centers = self.get_pupil_centers()
+
+            radii_p = [self.pupil_radius,self.pupil_radius,self.pupil_radius,self.pupil_radius,]
+
+            y_g, x_g = np.ogrid[:full_pupil_arr.shape[0],:full_pupil_arr.shape[1],]
+
+            pupil_sums = []
+
+            for i in range(4):
+                x_pupil, y_pupil = centers[i]
+
+                r_c = radii_p[i] + 3
+
+                circ = ((x_g - x_pupil) ** 2+ (y_g - y_pupil) ** 2<= r_c ** 2)
+
+                circle_sum = np.sum(full_pupil_arr[circ])
+
+                pupil_sums.append(circle_sum)
+
+            P1, P2, P3, P4 = pupil_sums
+            P_total = P1 + P2 + P3 + P4
+
+            if P_total == 0:
+                raise ValueError("Total pupil flux is zero")
+
+            Sx = ((P2 + P4) - (P1 + P3)) / P_total
+            Sy = ((P3 + P4) - (P1 + P2)) / P_total
+
+            if abs(Sx) < 1e-4:
+                Sx = 0
+
+            if abs(Sy) < 1e-4:
+                Sy = 0
+
+            #Tip/tilt direction
+            angle = np.arctan2(Sy,Sx)
+            angle_deg = np.degrees(angle) % 360
+
+            magnitude = np.sqrt(Sx**2+Sy**2)
+
+            #Image center
+            x_center = self.mask_center_x
+            y_center = self.mask_center_y
+
+            self.log.info(f"Image Center = ({x_center:.3f},{y_center:.3f})")
+
+            self.log.info(f"Delta x = {Sx}")
+
+            self.log.info(f"Delta y = {Sy}")
+
+            self.log.info(f"Magnitude = {magnitude}")
+
+            self.log.info(f"Tip/tilt angle = {angle_deg} degrees")
+
+            for i,pupil_sum in enumerate(pupil_sums,start=1):
+                self.log.info(f"Sum Pupil {i} = {pupil_sum}")
+
+            #Display alignment result
+            self.figure.clear()
+            self.axes = self.figure.add_subplot(111)
+
+            self.figure.patch.set_facecolor("black")
+            self.axes.set_facecolor("black")
+
+            for spine in self.axes.spines.values():
+                spine.set_color("white")
+
+            im = self.axes.imshow(full_pupil_arr,cmap="magma",aspect="equal",)
+
+            self.colorbar = self.figure.colorbar(im,ax=self.axes,shrink=0.8,)
+
+            self.colorbar.ax.tick_params(colors="white",labelsize=10,)
+
+            self.axes.set_xlabel("X (pixels)",color="white",fontsize=12,fontweight="bold",)
+
+            self.axes.set_ylabel("Y (pixels)",color="white",fontsize=12,fontweight="bold",)
+
+            self.axes.tick_params(colors="white",labelsize=10,)
+
+            theta = np.linspace(0,2*np.pi,200)
+
+            for i in range(4):
+                x_pupil,y_pupil = centers[i]
+
+                r_c = radii_p[i] + 3
+
+                self.axes.plot(x_pupil + r_c*np.cos(theta),y_pupil + r_c*np.sin(theta),"r-",linewidth=2,)
+
+                self.axes.text(x_pupil,y_pupil,i+1,color="white",fontsize=12,ha="center",va="center",)
+
+            #Image center
+            self.axes.scatter(x_center,y_center,color="red",marker="x",s=50,linewidths=2,zorder=10,)
+
+            #Arrow direction and length
+            length = 100*magnitude
+            angle_rad = np.deg2rad(angle_deg)
+            arrow_dx = length*np.cos(angle_rad)
+            arrow_dy = length*np.sin(angle_rad)
+
+            if length>0:
+                self.axes.annotate(
+                    '',
+                    xy=(x_center + arrow_dx,y_center + arrow_dy),
+                    xytext=(x_center,y_center),
+                    arrowprops=dict(
+                        arrowstyle='->',
+                        color='yellow',
+                        linewidth=2,
+                        mutation_scale=15,
+                        zorder=10,
+                    ),
+                )
+            else:
+                self.axes.scatter(
+                    x_center,
+                    y_center,
+                    color="red",
+                    marker="x",
+                    s=20,
+                )
+
+            self.axes.set_title(
+                (f"Pupil Alignment\n"
+                    f"Center = ({x_center:.2f},{y_center:.2f})    "
+                    f"Delta x = {Sx:.5f}    "
+                    f"Delta y = {Sy:.5f}    "
+                    f"Magnitude = {magnitude:.5f}    "
+                    f"Angle = {angle_deg:.2f}°"
+                ),color="white",fontsize=11,fontweight="bold",)
+
+            self.figure.subplots_adjust(left=0.1,right=0.94,top=0.88,bottom=0.12,)
+
+            self.canvas.draw()
+
+        except Exception as e:
+            self.log.error(f"Alignment calculation failed: {e}")
+
+            QMessageBox.critical(self,"Alignment Error",f"Failed to calculate pupil alignment:\n{e}",)
 
     ###
 

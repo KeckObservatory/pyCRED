@@ -402,7 +402,7 @@ class CredControlWidget(QWidget):
         control_layout.addWidget(image_box)
 
         ### Pupil Selection
-        pupil_box = QGroupBox("Pupil Selection & Alignment")
+        pupil_box = QGroupBox("Pupil Selection and Alignment")
         pupil_layout = QGridLayout(pupil_box)
 
         # Buttons

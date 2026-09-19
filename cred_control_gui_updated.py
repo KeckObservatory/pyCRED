@@ -1643,12 +1643,11 @@ class CredControlWidget(QWidget):
                 #self.axes.scatter(x_center,y_center,color="red",marker="x",s=20,)
 
             self.axes.set_title(
-                (f"Pupil Alignment\n"
-                    f"Center = ({x_center:.2f},{y_center:.2f})    "
-                    f"Delta x = {Sx:.5f}    "
-                    f"Delta y = {Sy:.5f}    "
-                    f"Magnitude = {magnitude:.5f}    "
-                    f"Angle = {angle_deg:.2f}°"
+                (f"Center = ({x_center:.2f},{y_center:.2f})\n"
+                    f"Delta x = {Sx:.5f}\n"
+                    f"Delta y = {Sy:.5f}\n"
+                    f"Magnitude = {magnitude:.5f}\n"
+                    f"Angle = {angle_deg:.2f}°\n"
                 ),color="white",fontsize=11,fontweight="bold",)
 
             self.figure.subplots_adjust(left=0.1,right=0.94,top=0.88,bottom=0.12,)

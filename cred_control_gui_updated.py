@@ -1561,6 +1561,9 @@ class CredControlWidget(QWidget):
             if abs(Sy) < 1e-4:
                 Sy = 0
 
+            Sx=Sx*10
+            Sy=Sy*10
+
             #Tip/tilt direction
             angle = np.arctan2(-Sy, Sx)
             angle_deg = np.degrees(angle) % 360

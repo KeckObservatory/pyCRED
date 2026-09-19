@@ -1571,8 +1571,6 @@ class CredControlWidget(QWidget):
             x_center = self.mask_center_x
             y_center = self.mask_center_y
 
-            self.log.info(f"Image Center = ({x_center:.3f},{y_center:.3f})")
-
             self.log.info(f"Delta x = {Sx}")
 
             self.log.info(f"Delta y = {Sy}")
@@ -1643,8 +1641,7 @@ class CredControlWidget(QWidget):
                 #self.axes.scatter(x_center,y_center,color="red",marker="x",s=20,)
 
             self.axes.set_title(
-                (f"Center = ({x_center:.2f},{y_center:.2f})\n"
-                    f"Delta x = {Sx:.5f}\n"
+                (f"Delta x = {Sx:.5f}\n"
                     f"Delta y = {Sy:.5f}\n"
                     f"Magnitude = {magnitude:.5f}\n"
                     f"Angle = {angle_deg:.2f}°\n"

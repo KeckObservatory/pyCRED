@@ -1640,8 +1640,8 @@ class CredControlWidget(QWidget):
                         zorder=10,
                     ),
                 )
-            #else:
-                #self.axes.scatter(x_center,y_center,color="red",marker="x",s=20,)
+            else:
+                self.axes.scatter(x_center,y_center,color="red",marker="x",s=20,)
 
             self.axes.set_title(
                 (f"Delta x = {Sx:.5f}\n"

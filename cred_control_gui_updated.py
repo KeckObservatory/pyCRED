@@ -1622,7 +1622,7 @@ class CredControlWidget(QWidget):
             #self.axes.scatter(x_center,y_center,color="red",marker="x",s=50,linewidths=2,zorder=10,)
 
             #Arrow direction and length
-            length = 500*magnitude
+            length = 50*magnitude
             angle_rad = np.deg2rad(angle_deg)
             arrow_dx = length * np.cos(angle_rad)
             arrow_dy = -length * np.sin(angle_rad)

@@ -1562,7 +1562,7 @@ class CredControlWidget(QWidget):
                 Sy = 0
 
             #Tip/tilt direction
-            angle = np.arctan2(Sy,Sx)
+            angle = np.arctan2(-Sy, Sx)
             angle_deg = np.degrees(angle) % 360
 
             magnitude = np.sqrt(Sx**2+Sy**2)
@@ -1621,8 +1621,8 @@ class CredControlWidget(QWidget):
             #Arrow direction and length
             length = 500*magnitude
             angle_rad = np.deg2rad(angle_deg)
-            arrow_dx = length*np.cos(angle_rad)
-            arrow_dy = length*np.sin(angle_rad)
+            arrow_dx = length * np.cos(angle_rad)
+            arrow_dy = -length * np.sin(angle_rad)
 
             if length>0:
                 self.axes.annotate(

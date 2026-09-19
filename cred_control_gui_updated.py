@@ -1618,7 +1618,7 @@ class CredControlWidget(QWidget):
                 self.axes.text(x_pupil,y_pupil,i+1,color="white",fontsize=12,ha="center",va="center",)
 
             #Image center
-            self.axes.scatter(x_center,y_center,color="red",marker="x",s=50,linewidths=2,zorder=10,)
+            #self.axes.scatter(x_center,y_center,color="red",marker="x",s=50,linewidths=2,zorder=10,)
 
             #Arrow direction and length
             length = 100*magnitude
@@ -1639,14 +1639,8 @@ class CredControlWidget(QWidget):
                         zorder=10,
                     ),
                 )
-            else:
-                self.axes.scatter(
-                    x_center,
-                    y_center,
-                    color="red",
-                    marker="x",
-                    s=20,
-                )
+            #else:
+                #self.axes.scatter(x_center,y_center,color="red",marker="x",s=20,)
 
             self.axes.set_title(
                 (f"Pupil Alignment\n"
